@@ -1,0 +1,38 @@
+# ---- メールデータ（個人情報。絶対にコミットしない） ----
+*.pst
+*.ost
+*.msg
+*.eml
+*.7z
+*.partial
+
+# ---- ビルド成果物（scripts/build.sh で再生成） ----
+build/
+dist/
+*.spec
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# ---- ツールのキャッシュ ----
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 実行時に作られるもの（ソースから試したとき用） ----
+*.tmp
+*.jsonl
+
+# ---- エディター・OS ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.claude/settings.local.json
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,20 @@
+{
+  "cutoff": "2021-01-01T00:00:00+09:00",
+  "server_root": "\\\\192.168.8.120\\PSTBackup",
+  "server_user": "pstmigration",
+  "server_password": "",
+  "work_dir": "%LOCALAPPDATA%\\PSTMigration\\work",
+  "disk_factor": 2.5,
+  "disk_reserve_gb": 5,
+  "logoff_snapshot_budget_gb": 10,
+  "split_pause_ms": 200,
+  "release_wait_sec": 900,
+  "sevenzip_level": 5,
+  "sevenzip_threads": 2,
+  "transfer_max_mbps": 50,
+  "slot_wait_min": 30,
+  "new_pst_warn_gb": 20,
+  "max_attempts": 3,
+  "recollect_on_change": false,
+  "log_subject": false
+}

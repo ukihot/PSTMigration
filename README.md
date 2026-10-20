@@ -1,0 +1,500 @@
+# PSTMigration
+
+社員PCに残っている **POP時代のPST** を、自動で回収し、NAS（`\192.168.8.120\PSTBackup`）に集めるツール。
+
+PSTの中のメールは、2021年1月1日を境に2つに分けて置く。
+
+| | 中身 | NASに置く形 | その後（手作業） |
+|---|---|---|---|
+| 旧メール | 2020年以前 | 7z に圧縮 | SharePoint に保管 |
+| 新メール | 2021年以降 | PST のまま | Purview で Exchange Online に取り込む |
+
+元のPSTは **一切変更・削除しない**（コピーを作って、そのコピーを加工する）。
+
+---
+
+## どんな動きをするか
+
+社員は何もしなくてよい。画面も出ない。GPO で配られ、次の流れで勝手に進む。
+
+```
+ ① サインイン  ──30分後──▶  PST を見つけて記録する                      （数秒）
+ ② シャットダウン / サインアウト ──▶  PST をコピーする                      （2GBで4秒）
+ ③ 次のサインイン ──30分後──▶  分割 → 7z圧縮 → NASへ転送 → 完了           （2GBで数十分）
+```
+
+- **なぜコピーがシャットダウン時なのか**：Outlook が起動している間は PST がロックされていて、読むことすらできない。Windows がシャットダウン時に Outlook を閉じたあとなら読める。社員が Outlook を開いたままシャットダウンしても問題ない。
+- **③の間も Outlook は普通に使える**。処理は低い優先度で、裏で動く。
+- **1回やればおしまい**。完了したPSTは、以後のサインイン・シャットダウンでは何もしない（数秒で終わる）。
+- 途中で電源が切れても、次回のサインインで続きから再開する。
+
+### 待ち時間の目安（パイロット実測）
+
+| 場面 | 社員から見て |
+|---|---|
+| シャットダウン時のコピー | 2GBで **4秒** 延びるだけ（SSD）。初回だけ |
+| サインイン後 | 何も変わらない（30分後から裏で動く） |
+
+---
+
+## 進み具合の見方
+
+### NAS で見る（いちばん簡単）
+
+`\192.168.8.120\PSTBackup\users\{メールアドレス}\{PC名}\`
+
+| 見えるもの | 状態 |
+|---|---|
+| フォルダー自体がない | まだ一度もツールが動いていない（①の前） |
+| `status.json` だけある | PSTは見つけた。コピーや転送はこれから |
+| `status.json` ＋ `{PST名}_..._{日時}\` フォルダーの中に 7z・PST・`report.json` | **完了**（旧メールが0件の人は 7z が無い。新メールが0件なら PST が無い。件数は `report.json` の `counts`） |
+
+> **注意**：NAS の `status.json` は、③の処理が **全部終わったときに** 更新される。処理の途中（数十分）は古いままなので、「変わっていない＝失敗」ではない。途中経過は下の「そのPCで見る」で。
+
+`status.json` の `status` の意味：
+
+| status | 意味 |
+|---|---|
+| `PENDING` | 順番待ち（②のコピー待ち、または③の開始待ち） |
+| `COMPLETED` | 完了 |
+| `RETRY_PENDING` | 失敗したが、次回自動でやり直す。放っておいてよい |
+| `FAILED` | 自動ではやり直さない。[エラーコード](#エラーコード) を見て対応 |
+
+全員分まとめて見るときは [5章](#5-運用) の `--aggregate`（Excel で開ける一覧ができる）。
+
+### そのPCで見る（処理中の様子）
+
+```powershell
+Get-Content $env:LOCALAPPDATA\PSTMigration\state.json -Encoding utf8 | Select-String '"status"|snapshot_at|"code"'
+```
+
+| 見えるもの | 意味 |
+|---|---|
+| `snapshot_at` が `null` | ②のコピーがまだ |
+| `snapshot_at` に時刻 | ②のコピー済み |
+| `status` が `SCANNING` `SPLITTING` `VERIFYING` `COMPRESSING` `TRANSFERRING` | ③の処理中（この順に進む） |
+| `status` が `COMPLETED` | 完了 |
+
+詳しいログは `%LOCALAPPDATA%\PSTMigration\logs\` の一番新しいファイル。
+
+---
+
+## 導入状況（2026-10-15 時点）
+
+| | 項目 | 状態 |
+|---|---|---|
+| ✅ | NAS の共有・アカウント | 済み（`config.json` にパスワード設定済み） |
+| ✅ | 配布物を NETLOGON に置く | 済み（`\tsuchiyoshi.private\NETLOGON\PSTMigration\`） |
+| ✅ | GPO `PSTMigration` | 作成済み・**`検証` OU にだけ** リンク |
+| ✅ | パイロット①② | TYCO205 で確認済み（検出・シャットダウン時コピー 4秒） |
+| ⏳ | パイロット③ | 確認中（分割・圧縮・NAS転送） |
+| ☐ | 全社展開 | ③が確認できたら `全社基本` にリンク（[4-7](#4-7-全社に広げる)） |
+
+ここから下は、作り直し・設定変更・トラブル時のための手順書。
+
+---
+
+## 1. ビルド
+
+ビルドPCに必要：[uv](https://docs.astral.sh/uv/)、7-Zip（EXEに内蔵するため。**配布先PCには不要**）
+
+```bash
+scripts/build.sh          # Git Bash
+scripts\build.bat         # cmd
+```
+
+lint（Ruff）→ テスト → EXE化 の順に走り、`dist/PSTMigration/` に配布一式ができる。
+
+| ファイル | 内容 |
+|---|---|
+| `PSTMigration.exe` | 本体（7-Zip CLI 内蔵、コンソールなし） |
+| `config.json` | 設定（[設定](#設定-configjson)） |
+| `7-Zip-License.txt` | 7-Zip のライセンス（LGPL。同梱が必要） |
+| `SHA256SUMS.txt` | 配布物のハッシュ（改ざん確認用。リリースごとに控えておく） |
+
+7-Zip が自動検出できない場合：`SEVENZIP_DIR=/c/path/to/7-Zip scripts/build.sh`
+
+**NAS のパスワードは `dist\PSTMigration\config.json` に書く**。プロジェクト直下の `config.json` には書かない（git 管理なので、リポジトリにパスワードが残る）。
+再ビルドすると `dist\` は直下の `config.json` で上書きされるので、**ビルドのたびに入れ直してから** NETLOGON に置く。
+
+## 2. NAS と配布場所の準備（初回のみ）
+
+NAS（`192.168.8.120`）は AD に参加していないので、**ツール専用のローカルアカウントを1つ** 作り、全PCがそのアカウントで書き込む。ユーザーごとのアクセス権は設定しない。
+
+### NAS
+
+1. NAS の管理画面で共有フォルダー `PSTBackup` を作る。
+2. ローカルユーザー `pstmigration`（名前は任意）を作り、`PSTBackup` に **読み書き** 権限を付ける。
+3. `config.json` の `server_user` / `server_password` にそのアカウントを書く。
+
+```json
+  "server_root": "\\\\192.168.8.120\\PSTBackup",
+  "server_user": "pstmigration",
+  "server_password": "（NASで設定したパスワード）",
+```
+
+ツールは起動時にこのアカウントで共有へ接続する（ドライブ文字は割り当てない。ユーザーからは見えない）。フォルダー `users\` `_slots\` `_admin\` は必要に応じて自動で作られる。
+
+> **割り切り**：パスワードは `config.json` に平文で入り、各PCの `%LOCALAPPDATA%\PSTMigration\bin\` と NETLOGON に置かれる。読み取れる人は NAS 上の全員分のPSTにアクセスできる。
+> 回収期間中だけの運用とし、**回収が終わったら NAS 側でアカウントを無効化するかパスワードを変える**。
+
+### NAS 上のフォルダー構成
+
+何百人分になるので、**メールアドレスのフォルダー** の中に結果が入るようにしている。
+
+```
+\\192.168.8.120\PSTBackup\
+    users\
+        taro.yamada@example.co.jp\
+            PC-0123\
+                status.json                                   このPCの処理状況
+                Outlook_3f9a1c0d2b7e_20261013190540\          元PST 1個分
+                    old_mail_before_20210101_PC-0123.7z
+                    new_mail_from_20210101_PC-0123.pst
+                    report.json
+            PC-0456\                                          同じ人の別PC
+    _slots\
+    _admin\
+```
+
+### メールアドレスの決め方
+
+各PCで、ログオン時に次の順で決める。決め方は `ledger.csv` の `mailbox_source` 列で分かる。
+
+| 順 | 取得元 | `mailbox_source` |
+|---|---|---|
+| 1 | Outlook に設定されているメールアカウント（1つだけの場合） | `OUTLOOK` |
+| 2 | AD のユーザーの `mail` 属性（Outlook のアカウントが複数・なしの場合） | `AD` |
+| 3 | 取れなければ Windows ユーザー名（フォルダー名がユーザー名になる） | `USERNAME` |
+
+- 一度アドレスが取れたPCは、次回取れなくても前回のアドレスを使い続ける。
+- 当社の AD は `mail` 属性が空のアカウントがある（少なくとも検証OU）。Outlook に共有アドレス（info@ など）も設定している人は `USERNAME` になりやすい。その人は Purview の CSV で手で記入する。
+
+### 配布場所（NETLOGON）
+
+各PCはドメインアカウントでログオンしており、ツールが接続する前は NAS を読めない。そのため配布物は NAS ではなく、全ドメインユーザーが読める NETLOGON に置く。
+
+```
+\\<ドメイン名>\NETLOGON\PSTMigration\    ← dist/PSTMigration/ の中身をコピー
+```
+
+### 同時転送枠
+
+VPN・サーバの負荷を抑えるため、同時に転送するPC台数をスロットファイルの数で制限する。5台にするなら：
+
+```powershell
+New-Item -ItemType Directory \\192.168.8.120\PSTBackup\_slots -Force
+1..5 | % { New-Item ("\\192.168.8.120\PSTBackup\_slots\slot{0:D2}.lock" -f $_) -ItemType File }
+```
+
+台数を変えるにはファイルを増減するだけでよい。`_slots` が無い・空なら制限なし。
+
+### 繋がらないとき
+
+- ドメインのGPOで「NTLM の制限：リモートサーバーへの送信 NTLM トラフィック」を拒否にしていると NAS に接続できない。
+- Windows 11 24H2 以降はクライアント側で SMB 署名が必須。古い NAS で署名に対応していないと接続できない（NAS の設定で SMB 署名を有効にする）。
+- ユーザーが同じ NAS に別のアカウントで手動接続していると、その接続のまま使う（ログに警告が出る）。
+
+## 3. 手動で動かす（GPO を待たずに試す・やり直す）
+
+GPO のタイミング（サインイン30分後・シャットダウン時）を待たずに、その場で各段階を動かせる。上の「どんな動きをするか」の①②③と対応している。
+
+```powershell
+$exe = "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe"
+
+# ① PSTを見つける（Outlook 起動中でOK）
+Start-Process $exe -Wait
+
+# ② PSTをコピーする（シャットダウンの代わり。Outlook を閉じてから）
+Start-Process $exe -ArgumentList "--snapshot" -Wait
+
+# ③ 分割 → 7z → NAS転送（Outlook を起動してから）
+Start-Process $exe -Wait
+```
+
+- EXE は画面を持たないので、`& $exe` と書くと終了を待たずに戻ってくる。**必ず `Start-Process -Wait`** で実行する。
+- 分割せずに件数だけ見たいときは、③の代わりに `--scan-only`。結果は `%LOCALAPPDATA%\PSTMigration\reports\{key}.scan.json`。
+
+### パイロットで確認すること
+
+- [ ] NAS の `users\{メールアドレス}\{PC名}\` ができる（フォルダー名がユーザー名なら、メールアドレスが取れていない → [メールアドレスの決め方](#メールアドレスの決め方)）
+- [ ] 完了後、その中の `{PST名}_..._{日時}\` に 7z・PST・`report.json` がある（0件の側のファイルは作られない）
+- [ ] `report.json` の `counts` で `mail = old + new + unmigrated`、かつ `unmigrated = 0`
+- [ ] 7z を展開した旧PSTと、新PSTを Outlook で開き、フォルダー・件数・添付・日時がそろっている
+- [ ] 元のPSTの件数が変わっていない（削除済みアイテムにゴミが増えていない）
+- [ ] Outlook のセキュリティ警告が出ない、ESET が EXE を検知しない（設計書 §14.1）
+
+## 4. GPO設定
+
+ドメインコントローラー（Windows Server 2012、`192.168.100.1`）の「グループ ポリシーの管理」で作業する。ドメインは `tsuchiyoshi.private`。
+
+方針：**新しい GPO を1つ作り、まず `検証` OU にだけリンクして試す**。問題なければ `全社基本` にもリンクする。既存の GPO には手を付けない（新しい GPO がリストに1行増えるだけ。他の GPO と設定が重ならないので、リンクの順番も気にしなくてよい）。
+
+### 4-1. 配布物を NETLOGON に置く
+
+DC 上で（またはエクスプローラーから）フォルダーを作り、`dist\PSTMigration\` の中身（パスワード入りの `config.json` を含む）をコピーする。
+
+```
+\\tsuchiyoshi.private\NETLOGON\PSTMigration\
+    PSTMigration.exe
+    config.json
+    7-Zip-License.txt
+    SHA256SUMS.txt
+```
+
+DC 上の実体は通常 `C:\Windows\SYSVOL\sysvol\tsuchiyoshi.private\scripts\PSTMigration\`。
+
+### 4-2. GPO を作ってリンクする
+
+1. 「グループ ポリシーの管理」で `tsuchiyoshi.private` → `全社基本` → **`検証`** を右クリック
+2. 「**このドメインに GPO を作成し、このコンテナーにリンクする**」
+3. 名前：`PSTMigration` → OK
+4. `検証` の下にできた `PSTMigration` を右クリック → 「**編集**」（グループ ポリシー管理エディターが開く）
+
+以下 4-3〜4-5 は、すべてエディターの **「ユーザーの構成」** 側で設定する（「コンピューターの構成」ではない）。
+
+### 4-3. EXE の配布（フォルダー → ファイル）
+
+ファイル配布は `*` で複数ファイルをコピーするとき **コピー先フォルダーを作らない**（無いと `0x80070003 指定されたパスが見つかりません` で失敗する）。先にフォルダーを作る項目を足す。
+
+**(1) ユーザーの構成 → 基本設定 → Windows の設定 → フォルダー** を右クリック → 新規作成 → フォルダー
+
+| タブ | 項目 | 値 |
+|---|---|---|
+| 全般 | アクション | 更新 |
+| 全般 | パス | `%LOCALAPPDATA%\PSTMigration\bin` |
+| 共通 | ログオンしたユーザーのセキュリティ コンテキストで実行する | ✅ チェックする |
+
+**(2) ユーザーの構成 → 基本設定 → Windows の設定 → ファイル** を右クリック → 新規作成 → ファイル（フォルダーの項目はファイルより先に処理される）
+
+| タブ | 項目 | 値 |
+|---|---|---|
+| 全般 | 操作 | **置換**（「更新」だと既存ファイルを上書きしない） |
+| 全般 | ソース ファイル | `\\tsuchiyoshi.private\NETLOGON\PSTMigration\*` |
+| 全般 | ターゲット フォルダー | `%LOCALAPPDATA%\PSTMigration\bin` |
+| 共通 | ログオンしたユーザーのセキュリティ コンテキストで実行する | ✅ チェックする |
+
+パスはすべて **`%LOCALAPPDATA%`** で書く（各ユーザーの `C:\Users\<ユーザー>\AppData\Local` になる）。基本設定の変数 `%LocalAppDataDir%` は、この環境ではフォルダー作成が `0x80070057 パラメーターが間違っています` で失敗したので使わない。
+
+ソース ファイルの **先頭は `\\`、末尾は `\*`**。`\*` が無いと「`PSTMigration` という名前のファイル」とみなされ、エラーも出ずに何もコピーされない。正しく入ると下の欄の表示が「ターゲット フォルダー」に変わる。
+
+うまく配られないときは、PCのイベント ビューアー → Windows ログ → Application で、ソース「Group Policy Files」（ID 4098 / 4117）にコピー元・コピー先と失敗理由が出る。
+
+### 4-4. ログオン時の自動実行（スケジュールされたタスク）
+
+**ユーザーの構成 → 基本設定 → コントロール パネルの設定 → タスク スケジューラ** を右クリック → 新規作成 → **スケジュールされたタスク (Windows 7 以降)**
+
+| タブ | 項目 | 値 |
+|---|---|---|
+| 全般 | 操作 | **作成**（「更新」「置換」にしない。下の注意） |
+| 全般 | 名前 | `PSTMigration` |
+| 全般 | タスクの実行時に使うユーザー アカウント | `%LogonDomain%\%LogonUser%`（「ユーザーまたはグループの変更」で入力） |
+| 全般 | セキュリティ オプション | 「ユーザーがログオンしているときのみ実行する」 |
+| トリガー | 新規 → タスクの開始 | 「ログオン時」、「特定のユーザー」で `%LogonDomain%\%LogonUser%` |
+| トリガー | 遅延時間を指定する | ✅ 30 分（選択肢に15分が無いため） |
+| 操作 | 新規 → 操作 | プログラムの開始 |
+| 操作 | プログラム/スクリプト | `%LOCALAPPDATA%\PSTMigration\bin\PSTMigration.exe` |
+| 条件 | コンピューターを AC 電源で使用している場合のみタスクを開始する | ☐ 外す |
+| 設定 | タスクを停止するまでの時間 | ☐ 外す |
+| 設定 | タスクが既に実行中の場合に適用される規則 | 新しいインスタンスを開始しない |
+
+**操作は必ず「作成」**。「更新」だと、グループポリシーが処理されるたび（サインイン直後・`gpupdate`・約90分ごとの自動更新）にタスクが登録し直される。登録し直されると、待機中の「ログオン30分後」の実行予定が消えて、**タスクが一度も動かない**（パイロットで発生：10:02 サインイン → 10:03 にタスクが再登録 → 10:32 に動かず）。
+「作成」はタスクが無いときだけ作り、以後は触らない。
+
+タスクの設定（遅延時間など）を後から変えたいときは、PC側のタスクが更新されないので、一度「置換」にして `gpupdate` で配り直し、すぐ「作成」に戻す。
+
+### 4-5. ログオフ時のスナップショット（スクリプト）
+
+**ユーザーの構成 → ポリシー → Windows の設定 → スクリプト (ログオン/ログオフ) → ログオフ** をダブルクリック → 追加
+
+| 項目 | 値 |
+|---|---|
+| スクリプト名 | `cmd.exe` |
+| スクリプトのパラメーター | `/c cd /d "%LOCALAPPDATA%\PSTMigration\bin" && if exist PSTMigration.exe start "" /wait PSTMigration.exe --snapshot` |
+
+**手入力せずコピー＆ペーストする**（`\` が抜けやすい。抜けていても止まりはしないが、スナップショットが取られない）。
+
+EXE を直接指定せず `cmd.exe` を挟むのは、(1) `%LOCALAPPDATA%` を確実に展開させるため、(2) `start /wait` で EXE の終了まで待たせるため（ウィンドウのない EXE は、待たずに終わったとみなされてログオフが進み、コピー途中で止められてしまう）。ログオフスクリプトは既定で非表示実行なので、黒い画面は出ない。
+
+**`if exist` は必須**。EXE がまだ配られていないPCで `start` すると「見つかりません」のエラーダイアログが **見えない画面に** 出て、誰も閉じられないままサインアウトが最大10分止まる（実際に起きた）。
+
+### 4-6. 効いているか確認する（検証 OU のPCで）
+
+```powershell
+gpupdate /force          # その後、一度サインアウトしてサインイン
+gpresult /r /scope user  # 「適用されたグループ ポリシー オブジェクト」に PSTMigration があること
+Get-ChildItem "$env:LOCALAPPDATA\PSTMigration\bin"      # EXE と config.json が配られている
+Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
+```
+
+その後の流れ：ログオン30分後に検出 → サインアウト時にスナップショット → 次回ログオン30分後に本処理。結果は NAS の `users\{メールアドレス}\{PC}\` と `ledger.csv` で確認する。
+
+### 4-7. 全社に広げる
+
+`全社基本` を右クリック → 「**既存の GPO をリンクする**」 → `PSTMigration` を選ぶ。`検証` OU は `全社基本` の下にあるので、`検証` 側のリンクは削除してよい（残しても二重には動かない）。
+
+**社員への周知**：初回だけシャットダウン・サインアウトが少し長くなることがある、と伝えておく（SSD なら数秒〜数十秒）。
+
+### 4-8. 回収が終わったら（GPO は残したまま止める）
+
+1. タスクの項目（4-4）を開き、操作を **「削除」** にする → 各PCのタスクが次回のポリシー処理で消える
+2. ログオフスクリプト（4-5）の行を **削除** する
+3. NAS の `pstmigration` アカウントを無効化する（各PCの `config.json` にパスワードが残っているため）
+
+フォルダーとファイルの項目（4-3）は残してもよい（EXE がPCに置かれるだけで、動かない）。
+
+### バージョンアップ
+
+`scripts/build.sh` → `dist/PSTMigration/` の中身で NETLOGON の `PSTMigration\` を上書きするだけ（`config.json` のパスワードを入れ直すのを忘れない）。ファイルの項目が「置換」なので、次回のポリシー処理（ログオン時・約90分ごと・`gpupdate`）で各PCへ配られる。ツールが実行中のPCでは EXE が使用中で差し替えに失敗するが、次のポリシー処理で入る。処理途中のPSTは state.json の続きから再開する。
+
+## 5. 運用
+
+### 進み具合を見る
+
+管理者PCで、先にエクスプローラーから `\\192.168.8.120\PSTBackup` を `pstmigration` アカウントで開いておき：
+
+```powershell
+Start-Process .\PSTMigration.exe -ArgumentList "--aggregate","\\192.168.8.120\PSTBackup" -Wait
+```
+
+`_admin\` に3つのCSVが出る（Excelでそのまま開ける）。
+
+| ファイル | 中身 |
+|---|---|
+| `ledger.csv` | 移行台帳。1行＝1PST。status・件数・エラーコード |
+| `purview_mapping_draft.csv` | Purview インポート用マッピングCSVのたたき台 |
+| `archive_list.csv` | 旧メール7zの一覧（サイズ・SHA-256） |
+
+`ledger.csv` で見るところ：
+
+- `status = PENDING` が何日も続く → そのPCが **ログオフされていない**（スリープ運用）。サインアウトを1回してもらう。
+- `status = FAILED` → `last_error_code` を見て[エラー対応](#エラーコード)。
+- `warnings` に何か出ている → 下の表を参照。
+
+### ステータス
+
+| status | 意味 |
+|---|---|
+| `PENDING` | 検出済み。次のログオフ（スナップショット）または次のログオン待ち |
+| `SCANNING` / `SPLITTING` / `VERIFYING` / `COMPRESSING` / `TRANSFERRING` | 処理中（または処理中に落ちた。次回続きから） |
+| `RETRY_PENDING` | 失敗。次回自動で再試行する |
+| `COMPLETED` | 完了。サーバに揃っている |
+| `FAILED` | 自動では再試行しない。管理者対応が必要 |
+| `SKIPPED` | 対象外（OST、旧スクリプトの出力PSTなど。`skip_reason` 参照） |
+
+### エラーコード
+
+一時的なもの（ネットワーク・容量など）は回数制限なしで次回再試行する。それ以外は `max_attempts`（既定3回）失敗すると `FAILED` になる。
+
+| コード | 意味 | 対応 |
+|---|---|---|
+| `OUTLOOK_UNAVAILABLE` | Classic Outlook に接続できない | New Outlook のみのPCでないか確認 |
+| `SOURCE_LOCKED` | ログオフ時にPSTが使用中 | 通常は次回で解消。続くなら Outlook がログオフ時に残っていないか |
+| `SOURCE_MISSING` | 元PSTが見つからない | ユーザーが移動・削除していないか |
+| `DISK_SPACE` | ローカルの空き不足（元PSTの約2.5倍＋5GB必要） | 空きを作るか、`work_dir` を別ドライブへ |
+| `NOT_PST` / `PST_OPEN_FAILED` | PSTとして開けない（破損など） | scanpst で修復したコピーを手作業で処理 |
+| `COUNT_MISMATCH` | 分割後の件数が合わない | 自動でスナップショットから取り直す。3回続いたら FAILED。ログ確認 |
+| `PST_LOCKED` | Outlook（またはウイルス対策ソフト）が作業用PSTを手放さない | 次回ログオン時に続きから。放置でよい |
+| `OUTLOOK_LOST` | 処理中に Outlook が終了・クラッシュした（社員が閉じた等） | 次回ログオン時に続きから。放置でよい。同じPCで毎回続くなら Outlook のクラッシュをイベントログで確認 |
+| `ARCHIVE_FAILED` / `ARCHIVE_TEST_FAILED` | 7z 圧縮・テストの失敗 | ログの7z出力を確認。AppLocker で `%TEMP%` 実行禁止なら設計書 §10.1 |
+| `SLOT_BUSY` | 転送枠が空かない | スロットを増やすか放置 |
+| `NETWORK` / `ACCESS_DENIED` | NAS に書けない | NAS の電源・VPN接続、`server_user` / `server_password`、NAS 側の読み書き権限、[繋がらないとき](#繋がらないとき) |
+| `HASH_MISMATCH` | 転送後のハッシュ不一致 | 自動で再転送。続くならネットワーク／サーバのディスクを疑う |
+| `REMOTE_CONFLICT` | サーバに同名で中身の違うファイルがある | 上書きはしない。どちらが正しいか確認して手で整理 |
+| `UNMIGRATED_ITEMS` | 日付の取れないメールがある（転送自体は済んでいる） | report.json の `errors` で場所を確認。元PSTに残っているので個別対応 |
+| `UNEXPECTED` | 想定外の例外 | ローカルログのスタックトレースを確認 |
+
+| 警告（warnings） | 意味 |
+|---|---|
+| `SNAPSHOT_OVER_BUDGET` | PSTが `logoff_snapshot_budget_gb` より大きく、ログオフ時にコピーしない。そのPCだけ予算を上げるなら config を個別配布 |
+| `SOURCE_CHANGED` | 完了後に元PSTのメールが増減した（下の再収集を参照） |
+| `NEW_PST_OVER_LIMIT` | 新メールPSTが20GB超。Purview 投入前に手で分割を検討 |
+| `ARTIFACT_MISSING` / `SNAPSHOT_MISSING` | 作業ファイルが消えていたので最初からやり直した |
+
+### FAILED を再試行させる
+
+原因を取り除いたあと、**そのPCで・そのユーザーとして**：
+
+```powershell
+Start-Process "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe" -ArgumentList "--reset","<pst_key>" -Wait
+```
+
+`pst_key` は ledger.csv の列にある。途中まで済んでいる段階は保持され、続きから再開する。
+
+### 完了後に元PSTが変わった（再収集）
+
+ユーザーがIMAPのメールをPSTに移すと、完了済みでも `SOURCE_CHANGED` 警告が付く。既定では再収集しない。
+Phase 3 の直前に最終回収したい場合は、`config.json` を `"recollect_on_change": true` にして配布する。次回ログオン以降、変更のあったPSTが **別フォルダーに** 再収集される（既存は残る）。
+
+### ログの場所（各PC）
+
+```
+%LOCALAPPDATA%\PSTMigration\
+    state.json          全PSTの状態（これが正）
+    logs\run-*.jsonl    実行ログ（30日で自動削除）
+    reports\{key}.json  完了したPSTの report（サーバと同じもの）
+    work\{key}\         作業中ファイル（完了すると消える）
+```
+
+## 6. 設定 (config.json)
+
+`PSTMigration.exe` と同じフォルダーの `config.json` を読む。キーを間違えると何もせず終了する（ログにエラーが出る）。
+
+| キー | 既定 | 説明 |
+|---|---|---|
+| `cutoff` | `2021-01-01T00:00:00+09:00` | 分割の基準日時（タイムゾーン必須）。出力ファイル名の日付にもなる |
+| `server_root` | `\\192.168.8.120\PSTBackup` | 転送先 |
+| `server_user` / `server_password` | `pstmigration` / 空 | NAS のローカルアカウント。`server_user` が空なら、ログオンユーザーの資格情報のまま接続を試みる |
+| `work_dir` | `%LOCALAPPDATA%\PSTMigration\work` | 作業フォルダー。Cドライブが小さいPCは変更 |
+| `disk_factor` / `disk_reserve_gb` | 2.5 / 5 | 必要空き容量 = 元PSTサイズ × factor + reserve |
+| `logoff_snapshot_budget_gb` | 10 | 1回のログオフでコピーする合計上限（ログオフ待ちを抑える） |
+| `split_pause_ms` | 200 | 分割中、100件ごとの休み。Outlook が重いと言われたら増やす |
+| `release_wait_sec` | 900 | Outlook が出力PSTを手放すまで待つ秒数（パイロットで約9分かかった） |
+| `sevenzip_level` / `sevenzip_threads` | 5 / 2 | 7z の圧縮レベル・スレッド数 |
+| `transfer_max_mbps` | 50 | 1台あたりの転送帯域上限（0で無制限） |
+| `slot_wait_min` | 30 | 転送枠の空き待ち上限 |
+| `new_pst_warn_gb` | 20 | 新メールPSTの警告サイズ |
+| `max_attempts` | 3 | 一時的でないエラーの再試行上限 |
+| `recollect_on_change` | false | 完了後の変更で再収集するか |
+| `log_subject` | false | 日付取得不能メールの件名を report に残すか（障害解析時のみ true に） |
+
+## 後続作業（SharePoint / Purview）
+
+設計書 §13.1 の要約。全PC完了後（または区切りのいいところで）。
+
+**新メール → Exchange Online**
+
+1. `--aggregate` で出た `purview_mapping_draft.csv` を確認する。`Mailbox` 列はメールアドレスのフォルダー名から自動で入っている。M365 のアドレスと違う人がいれば直す。`Note = MAILBOX_UNKNOWN` の行は空欄なので記入する。
+2. `Note = MULTIPLE_UNITS` の行（1人に複数のPSTがある）は、どれを入れるか決める。決めたら `Note` 列は削除する。
+3. AzCopy で `users\` を `--include-pattern "*.pst"` 付きでアップロードする（CSVの `FilePath` と同じ相対パスになる）。
+4. Purview でインポートジョブを作る。`TargetRootFolder` は `/POP移行メール` のままにする（IMAP移行分と混ざらない）。
+
+**旧メール → SharePoint Online**
+
+1. `users\` 配下の各収集フォルダーから `*.7z` と `report.json` を移す。
+2. `archive_list.csv` のサイズ・SHA-256 と突き合わせる。
+
+---
+
+## 開発メモ
+
+```powershell
+uv sync                                  # 依存（pywin32, pyinstaller, pytest, ruff）
+uv run pytest -q                         # Outlook 不要の単体テスト
+uv run ruff check --fix . ; uv run ruff format .
+
+# ソースから直接実行（ログは %LOCALAPPDATA%\PSTMigration\logs と画面に出る）
+$env:PYTHONPATH = "src"; uv run python -m pstmigration --scan-only
+```
+
+| ファイル | 役割 |
+|---|---|
+| `src/pstmigration/__main__.py` | 引数・多重起動防止・ログ |
+| `src/pstmigration/pipeline.py` | 処理の流れ（スナップショット、分割→圧縮→転送→完了） |
+| `src/pstmigration/outlook.py` | Outlook COM（検出・マウント・調査・Move・件数検証） |
+| `src/pstmigration/rules.py` | 日付判定などの純粋ロジック（テストはここが中心） |
+| `src/pstmigration/transfer.py` | SMB転送・転送枠・SHA-256 |
+| `src/pstmigration/report.py` | report.json / status.json / 集計CSV |
+| `src/pstmigration/state.py` / `config.py` | 状態ファイル・設定 |
+
+旧 `Split-PstByDate.ps1` は廃止（元PSTに `Copy()` で書き込む問題があったため。設計書 §1.1）。

@@ -1,0 +1,20 @@
+[project]
+name = "pstmigration"
+version = "1.0.1"
+description = "POP時代のPSTを日付で分割し、ファイルサーバへ回収するGPO配布ツール"
+requires-python = ">=3.12"
+dependencies = ["pywin32>=306"]
+
+[dependency-groups]
+dev = ["pyinstaller>=6.10", "pytest>=8", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
