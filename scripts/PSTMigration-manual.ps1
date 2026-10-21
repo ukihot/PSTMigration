@@ -14,8 +14,23 @@ function Run([string[]]$a) {
     if ($p.ExitCode -ne 0) { Fail "PSTMigration.exe が異常終了しました（exit=$($p.ExitCode)）。$home_\logs の最新ログを確認してください。" }
 }
 
+function Wait-OutlookExit($minutes, $msg) {
+    $deadline = (Get-Date).AddMinutes($minutes)
+    while (Get-Process OUTLOOK -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) { Fail $msg }
+        Start-Sleep 5
+    }
+}
+
 if (Get-Process PSTMigration -ErrorAction SilentlyContinue) { Fail "PSTMigration が実行中です。終わってからもう一度実行してください。" }
-if (Get-Process OUTLOOK -ErrorAction SilentlyContinue) { Fail "Outlook を閉じてから実行してください（通知領域に残っていないかも確認）。" }
+$ol = Get-Process OUTLOOK -ErrorAction SilentlyContinue
+if ($ol | Where-Object MainWindowHandle -ne 0) { Fail "Outlook を閉じてから実行してください。" }
+if ($ol) {
+    # 画面のない Outlook ＝ 途中で止めた PSTMigration が裏で起動した残り。普通に終了させる
+    Step "裏で動いている Outlook を終了します"
+    try { [Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application").Quit() } catch {}
+    Wait-OutlookExit 2 "Outlook が終了しません。タスクマネージャーで OUTLOOK.EXE を終了してから、もう一度実行してください。"
+}
 
 # bin\config.json は GPO で上書きされるので、上限を外したコピーを別に作る
 $t = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "config.json"))
@@ -26,11 +41,7 @@ Step "① PSTを検出（Outlook を裏で起動します）"
 Run @("--config", $cfg)
 
 # ①で裏起動した Outlook が終わるのを待つ（起動中だとコピーできない）
-$deadline = (Get-Date).AddMinutes(3)
-while (Get-Process OUTLOOK -ErrorAction SilentlyContinue) {
-    if ((Get-Date) -gt $deadline) { Fail "Outlook が終了しません。タスクマネージャーで OUTLOOK.EXE が消えてから、もう一度実行してください。" }
-    Start-Sleep 5
-}
+Wait-OutlookExit 3 "Outlook が終了しません。開いていたら閉じてください。タスクマネージャーで OUTLOOK.EXE が消えてから、もう一度実行してください。"
 
 Step "② PSTをコピー（20GBで数分。Outlook はまだ開かないでください）"
 Run @("--snapshot", "--config", $cfg)
