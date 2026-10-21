@@ -21,6 +21,7 @@ STATUS_KEYS = (
     "status",
     "checkpoint",
     "generation",
+    "cutoff",
     "snapshot_at",
     "remote_dir",
     "counts",

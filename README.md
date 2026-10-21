@@ -412,6 +412,7 @@ Start-Process .\PSTMigration.exe -ArgumentList "--aggregate","\\192.168.8.120\PS
 |---|---|
 | `SNAPSHOT_OVER_BUDGET` | PSTが `logoff_snapshot_budget_gb` より大きく、ログオフ時にコピーしない。そのPCだけ予算を上げるなら config を個別配布 |
 | `SOURCE_CHANGED` | 完了後に元PSTのメールが増減した（下の再収集を参照） |
+| `STALE_REMOTE_LEFT` | `cutoff` 変更前の NAS フォルダーを消せなかった。`stale_remote_dirs` のフォルダーを手で削除 |
 | `NEW_PST_OVER_LIMIT` | 新メールPSTが20GB超。Purview 投入前に手で分割を検討 |
 | `ARTIFACT_MISSING` / `SNAPSHOT_MISSING` | 作業ファイルが消えていたので最初からやり直した |
 
@@ -446,7 +447,7 @@ Phase 3 の直前に最終回収したい場合は、`config.json` を `"recolle
 
 | キー | 既定 | 説明 |
 |---|---|---|
-| `cutoff` | `2021-01-01T00:00:00+09:00` | 分割の基準日時（タイムゾーン必須）。出力ファイル名の日付にもなる |
+| `cutoff` | `2021-01-01T00:00:00+09:00` | 分割の基準日時（タイムゾーン必須）。出力ファイル名の日付にもなる。**途中で変えると**、変更前の値で処理済み・処理中のPSTは次回ログオンで最初（ログオフ時のコピー）からやり直し、新しいフォルダーへの転送が済んだ時点で旧フォルダーを NAS から消す |
 | `server_root` | `\\192.168.8.120\PSTBackup` | 転送先 |
 | `server_user` / `server_password` | `pstmigration` / 空 | NAS のローカルアカウント。`server_user` が空なら、ログオンユーザーの資格情報のまま接続を試みる |
 | `work_dir` | `%LOCALAPPDATA%\PSTMigration\work` | 作業フォルダー。Cドライブが小さいPCは変更 |

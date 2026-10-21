@@ -36,6 +36,7 @@ log = logging.getLogger(__name__)
 GB = 1024**3
 SNAPSHOT = "snapshot.pst"
 SCAN = "scan.json"
+LEGACY_CUTOFF = "2021-01-01T00:00:00+09:00"  # 1.0.1 までは PST ごとに記録していない。当時配布した config の値
 CONTACTS_DIR = "contacts"  # 作業フォルダー内。PSTごとのフォルダー名（12桁の16進）とは重ならない
 SNAPSHOT_LABEL = "PSTMigration作業中（操作しないでください）"
 
@@ -81,6 +82,22 @@ def _reset_to_snapshot(entry: dict, work: Path, code: str) -> None:
     entry.update(checkpoint=None, snapshot_at=None, outputs={}, status="PENDING")
     warn(entry, code)
     log.warning("PST %s: %s のためスナップショットから再取得します", entry["key"], code)
+
+
+def _restart(entry: dict, work: Path) -> None:
+    """ログオフ時のスナップショットから全部やり直す（新しい世代として別フォルダーに出す）。"""
+    shutil.rmtree(work, ignore_errors=True)
+    entry.update(
+        status="PENDING",
+        checkpoint=None,
+        snapshot_at=None,
+        outputs={},
+        counts={},
+        attempts=0,
+        last_error=None,
+        warnings=[],
+        generation=entry.get("generation", 1) + 1,
+    )
 
 
 def wait_released(path: Path, seconds: float) -> bool:
@@ -152,6 +169,7 @@ def run_snapshot(cfg: Config, home: Path) -> None:
                 log.info("PST %s: 今回の上限を使い切ったため次回ログオフへ", e["key"])
                 continue
             work = cfg.work_path / e["key"]
+            shutil.rmtree(work, ignore_errors=True)  # 新しい世代の始まり。前の世代の scan.json 等を使わせない
             work.mkdir(parents=True, exist_ok=True)
             _check_disk(work, rules.disk_needed(size, cfg.disk_factor, cfg.disk_reserve_gb))
             t0 = time.monotonic()
@@ -205,6 +223,9 @@ def _run_7z(args: list[str], cwd: Path, code: str) -> None:
         errors="replace",
         creationflags=subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS,
     )
+    if r.returncode == 1:
+        # 7z の「警告」終了＝ファイルを開けなかった（使用中）。PSTの問題ではないので回数に数えない
+        raise StepError("PST_LOCKED", f"7z exit=1 {r.stderr.strip()[-500:]}", transient=True)
     if r.returncode != 0:
         raise StepError(code, f"7z exit={r.returncode} {r.stderr.strip()[-500:]}")
 
@@ -227,6 +248,7 @@ class Runner:
             self.ol.cleanup(self.cfg.work_path)
             self._resolve_mailbox()
             self._sync()
+            self._apply_cutoff()
             self.st.data["last_run_error"] = None
             if not self.scan_only:
                 self._backup_contacts()  # 小さいので、時間のかかる分割より先に
@@ -280,19 +302,41 @@ class Runner:
             if e["status"] == "COMPLETED" and self.ol.live_counts(d["store"]) != e.get("folder_counts"):
                 if self.cfg.recollect_on_change:
                     log.info("PST %s: 完了後に変更あり。再収集します", e["key"])
-                    e.update(
-                        status="PENDING",
-                        checkpoint=None,
-                        snapshot_at=None,
-                        outputs={},
-                        counts={},
-                        attempts=0,
-                        last_error=None,
-                        warnings=[],
-                        generation=e.get("generation", 1) + 1,
-                    )
+                    _restart(e, self.cfg.work_path / e["key"])
                 else:
                     warn(e, "SOURCE_CHANGED")
+
+    def _apply_cutoff(self) -> None:
+        """config の cutoff が変わったら、旧 cutoff で分けたPSTを作り直す。
+
+        旧世代の NAS フォルダーは、新世代の転送が済んだ時点で消す（_finish）。それまでは残すので、
+        NAS 上に何もない期間はできない。
+        """
+        for e in self.st.psts.values():
+            if e["status"] == "SKIPPED":
+                continue
+            started = e.get("snapshot_at") or e.get("checkpoint") or e["status"] in TERMINAL
+            same = datetime.fromisoformat(e.get("cutoff") or LEGACY_CUTOFF) == self.cfg.cutoff_local
+            if started and not same:
+                log.info("PST %s: cutoff が %s に変わったため作り直します", e["key"], self.cfg.cutoff)
+                if e.get("remote_dir"):
+                    e.setdefault("stale_remote_dirs", []).append(e["remote_dir"])
+                _restart(e, self.cfg.work_path / e["key"])
+                e["remote_dir"] = None
+            e["cutoff"] = self.cfg.cutoff
+
+    def _purge_stale(self, e: dict) -> None:
+        for d in list(e.get("stale_remote_dirs") or []):
+            try:
+                shutil.rmtree(self.cfg.server_path / d)
+            except FileNotFoundError:
+                pass
+            except OSError as ex:
+                log.warning("PST %s: 旧 cutoff のフォルダーを消せません（手で削除）: %s", e["key"], ex)
+                warn(e, "STALE_REMOTE_LEFT")
+                continue
+            log.info("PST %s: 旧 cutoff のフォルダーを削除: %s", e["key"], d)
+            e["stale_remote_dirs"].remove(d)
 
     # ---- 連絡先バックアップ（日付で分けず、毎回作り直して NAS 上を置き換える） ----
 
@@ -488,6 +532,9 @@ class Runner:
             self.st.save()
             return
 
+        # 上の SHA-256 計算（数GBで数分）の間に、ウイルス対策ソフト等が旧PSTを開くことがあるので直前にもう一度待つ
+        if not wait_released(old_pst, c.release_wait_sec):
+            raise StepError("PST_LOCKED", f"ファイルが使用中のままです: {old_pst.name}", transient=True)
         _run_7z(
             [
                 "a",
@@ -553,6 +600,7 @@ class Runner:
         except OSError as ex:
             raise StepError("NETWORK", str(ex), transient=True) from ex
         e["status"] = status
+        self._purge_stale(e)  # 新世代が NAS に揃ったので、旧 cutoff の分を消す
         if status == "COMPLETED":
             e["last_error"] = None  # 途中で再試行した名残を台帳に残さない
         e["finished_at"] = rep["finished_at"]

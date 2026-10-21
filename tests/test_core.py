@@ -313,3 +313,35 @@ def test_upload_overwrite_replaces_backup(tmp_path):
         transfer.upload(src, dst, transfer.sha256_file(src), 0)  # 通常は上書きしない
     transfer.upload(src, dst, transfer.sha256_file(src), 0, overwrite=True)
     assert dst.read_bytes() == b"new contacts"
+
+
+def test_cutoff_change_redoes_and_purges_old_generation(tmp_path):
+    from pstmigration import pipeline
+
+    nas, work = tmp_path / "nas", tmp_path / "work"
+    old_dir = r"users\a@x.jp\PC1\Outlook_k1_20261013190540"
+    (nas / old_dir).mkdir(parents=True)
+    (work / "k1").mkdir(parents=True)
+    done = new_entry("k1", r"C:\a.pst", False) | {
+        "status": "COMPLETED",
+        "checkpoint": "TRANSFERRED",
+        "remote_dir": old_dir,
+    }
+    fresh = new_entry("k2", r"C:\b.pst", False)  # まだ何もしていない（1.0.1 の state なので cutoff なし）
+    write_json(tmp_path / "state.json", {"psts": {"k1": done, "k2": fresh}})
+
+    r = pipeline.Runner(
+        config.Config(cutoff="2016-01-01T00:00:00+09:00", server_root=str(nas), work_dir=str(work)), tmp_path
+    )
+    r._apply_cutoff()
+    k1, k2 = r.st.psts["k1"], r.st.psts["k2"]
+    assert (k1["status"], k1["checkpoint"], k1["remote_dir"], k1["generation"]) == ("PENDING", None, None, 2)
+    assert k1["stale_remote_dirs"] == [old_dir] and not (work / "k1").exists()
+    assert (nas / old_dir).exists()  # 新世代が揃うまでは消さない
+    assert (k2["generation"], k2["cutoff"]) == (1, "2016-01-01T00:00:00+09:00")
+
+    r._apply_cutoff()  # 同じ cutoff ならもう何もしない
+    assert k1["generation"] == 2
+
+    r._purge_stale(k1)
+    assert not (nas / old_dir).exists() and k1["stale_remote_dirs"] == []
