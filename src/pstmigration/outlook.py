@@ -152,6 +152,20 @@ class Outlook:
         except pywintypes.com_error as e:
             raise StepError("OUTLOOK_UNAVAILABLE", str(e), transient=True) from e
 
+    def quit_if_headless(self) -> bool:
+        """本ツールが裏で起動した（画面のない）Outlook なら終了させ、True を返す。
+
+        画面のない Outlook は、切り離したPSTも終了するまで掴み続ける（パイロットで確認）。
+        ユーザーが開いている Outlook は閉じない。
+        """
+        try:
+            if self.app.Explorers.Count or self.app.Inspectors.Count:
+                return False
+            self.app.Quit()
+        except (pywintypes.com_error, AttributeError):
+            pass  # もう終わっている
+        return True
+
     def alive(self) -> bool:
         """Outlook のプロセスがまだいるか。落ちると dynamic Dispatch は AttributeError を出す。"""
         try:

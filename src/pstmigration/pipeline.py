@@ -237,19 +237,37 @@ class Runner:
         self.scan_only = scan_only
         self.names = rules.output_names(cfg.cutoff_local, _computer())
         self.st = State(home / "state.json")
-        self.ol = None
+        self.ol = None  # 裏起動の Outlook を終了させた後は None（必要になったら _outlook() で起動し直す）
+        self.ol_lost = False  # 処理中に Outlook が落ちた。残りは次回ログオンで
 
-    def run(self) -> None:
+    def _outlook(self):
         from pstmigration.outlook import Outlook  # COM はログオン時のみ
 
-        transfer.connect(self.cfg.server_root, self.cfg.server_user, self.cfg.server_password)
-        try:
+        if self.ol is None:
             self.ol = Outlook()
-            self.ol.cleanup(self.cfg.work_path)
+        return self.ol
+
+    def _let_go(self) -> None:
+        """切り離したPSTを Outlook に手放させる（裏起動の Outlook なら終了させる）。"""
+        if self.ol is not None and self.ol.quit_if_headless():
+            log.info("裏で起動した Outlook を終了しました（PSTを手放させるため）")
+            self.ol = None
+
+    def _ol_died(self) -> bool:
+        if self.ol is not None and not self.ol.alive():
+            self.ol, self.ol_lost = None, True
+        return self.ol_lost
+
+    def run(self) -> None:
+        transfer.connect(self.cfg.server_root, self.cfg.server_user, self.cfg.server_password)
+        ready = False
+        try:
+            self._outlook().cleanup(self.cfg.work_path)
             self._resolve_mailbox()
             self._sync()
             self._apply_cutoff()
             self.st.data["last_run_error"] = None
+            ready = True
             if not self.scan_only:
                 self._backup_contacts()  # 小さいので、時間のかかる分割より先に
         except (StepError, pywintypes.com_error) as e:
@@ -261,10 +279,10 @@ class Runner:
             }
         self.st.save()
 
-        if self.ol is not None:
+        if ready:
             for e in list(self.st.psts.values()):
-                if self.ol is None:
-                    break  # 途中で Outlook が落ちた。残りは次回ログオンで
+                if self.ol_lost:
+                    break
                 if e["status"] in TERMINAL:
                     continue
                 if not e.get("checkpoint") and not e.get("snapshot_at"):
@@ -350,11 +368,14 @@ class Runner:
                 raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
-            store = self.ol.mount(pst, create=True, label="連絡先バックアップ")
+            ol = self._outlook()
+            store = ol.mount(pst, create=True, label="連絡先バックアップ")
             try:
-                count = self.ol.export_contacts(store, self.cfg.work_path)
+                count = ol.export_contacts(store, self.cfg.work_path)
             finally:
-                self.ol.unmount(store)
+                ol.unmount(store)
+                del store
+            self._let_go()
             if count:
                 if not wait_released(pst, self.cfg.release_wait_sec):
                     raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
@@ -371,8 +392,7 @@ class Runner:
             log.info("連絡先バックアップ: %d 件", count)
             shutil.rmtree(work, ignore_errors=True)
         except Exception as ex:  # 連絡先が失敗してもメール移行は続ける
-            if not self.ol.alive():
-                self.ol = None  # 残りの処理は次回ログオンで
+            self._ol_died()
             code = getattr(ex, "code", "OUTLOOK_COM" if isinstance(ex, pywintypes.com_error) else "UNEXPECTED")
             log.warning("連絡先バックアップに失敗: %s", ex, exc_info=code == "UNEXPECTED")
             c["last_error"] = {"code": code, "message": str(ex)[:500], "at": now_iso()}
@@ -392,6 +412,7 @@ class Runner:
                 return
             if e.get("checkpoint") is None and not self._split(e, work):
                 return
+            self._let_go()  # 以降（7z・転送）は Outlook を使わない。分割したPSTを手放させる
             if e["checkpoint"] == "SPLIT":
                 self._archive(e, work)
                 self.st.save()
@@ -404,9 +425,8 @@ class Runner:
             apply_error(e, self._classify(e, ex), self.cfg.max_attempts)
 
     def _classify(self, e: dict, ex: Exception) -> StepError:
-        if not self.ol.alive():
+        if self._ol_died():
             # 処理中に Outlook が終了・クラッシュした。PST側の問題ではないので回数に数えない
-            self.ol = None
             return StepError("OUTLOOK_LOST", repr(ex), transient=True)
         if isinstance(ex, StepError):
             return ex
@@ -454,7 +474,7 @@ class Runner:
         e["status"] = "SCANNING"
         self.st.save()
         t0 = time.monotonic()
-        ol = self.ol
+        ol = self._outlook()
         snap_store = old_store = new_store = None
         bad: list[str] = []
         try:
@@ -490,6 +510,7 @@ class Runner:
                     ol.unmount(s)
 
         if bad:
+            self._let_go()
             for p in (snap, old_path, new_path):
                 wait_released(p, self.cfg.release_wait_sec)
             shutil.rmtree(work, ignore_errors=True)

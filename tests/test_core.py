@@ -129,7 +129,10 @@ def test_classify_outlook_lost_and_file_lock():
             return self.up
 
     r = object.__new__(Runner)
+    r.ol_lost = False
     e = new_entry("k", "p", False)
+    r.ol = None  # 裏起動の Outlook を自分で終了させた後のエラーは Outlook 落ちではない
+    assert r._classify(e, PermissionError(13, "Permission denied")).code == "PST_LOCKED"
     r.ol = FakeOutlook(True)
     assert r._classify(e, PermissionError(13, "Permission denied")).code == "PST_LOCKED"
     assert r._classify(e, StepError("DISK_SPACE", transient=True)).code == "DISK_SPACE"
@@ -138,7 +141,26 @@ def test_classify_outlook_lost_and_file_lock():
     assert err.code == "UNEXPECTED"  # Outlook が生きているなら本当のバグ
     r.ol = FakeOutlook(False)
     err = r._classify(e, AttributeError("GetItemFromID.Move"))
-    assert (err.code, err.transient, r.ol) == ("OUTLOOK_LOST", True, None)
+    assert (err.code, err.transient, r.ol, r.ol_lost) == ("OUTLOOK_LOST", True, None, True)
+
+
+def test_let_go_quits_only_headless_outlook():
+    from pstmigration.pipeline import Runner
+
+    class FakeOutlook:
+        def __init__(self, headless):
+            self.headless = headless
+
+        def quit_if_headless(self):
+            return self.headless
+
+    r = object.__new__(Runner)
+    r.ol = FakeOutlook(False)  # ユーザーが開いている Outlook はそのまま使い続ける
+    r._let_go()
+    assert r.ol is not None
+    r.ol = FakeOutlook(True)
+    r._let_go()
+    assert r.ol is None  # 次に要るとき _outlook() で起動し直す
 
 
 # ---- 転送 ------------------------------------------------------------------------
