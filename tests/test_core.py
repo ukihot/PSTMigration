@@ -442,3 +442,23 @@ def test_split_moves_in_batches_and_falls_back(monkeypatch):
     assert ol.split(snap, old, new, None, 0, ids) == 1202
     assert mover.calls == [("O", 500)] and mover.closed
     assert len(moved_each) == 700 + 2
+
+
+def test_rows_reads_table_in_row_major_batches():
+    """Table.GetArray は a[行][列] で返る（実機で確認）。転置せずに1行ずつ返すこと。"""
+    from types import SimpleNamespace
+
+    from pstmigration import outlook
+
+    batches = iter([(("id1", "s1"), ("id2", "s2")), (("id3", "s3"),)])
+    table = SimpleNamespace(EndOfTable=False, Columns=SimpleNamespace(RemoveAll=lambda: None, Add=lambda c: None))
+
+    def get_array(n):
+        assert n == outlook.TABLE_BATCH
+        rows = next(batches, ())
+        table.EndOfTable = rows == () or len(rows) < 2
+        return rows
+
+    table.GetArray = get_array
+    folder = SimpleNamespace(GetTable=lambda *a: table)
+    assert list(outlook._rows(folder)) == [("id1", "s1"), ("id2", "s2"), ("id3", "s3")]

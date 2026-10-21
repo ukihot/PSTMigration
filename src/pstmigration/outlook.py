@@ -52,6 +52,7 @@ MAX_PROBLEMS = 1000
 
 MESSAGE_MOVE = 0x1  # IMAPIFolder::CopyMessages のフラグ
 MOVE_BATCH = 500  # 1回の CopyMessages で移す件数（中断してもこの単位で続きから）
+TABLE_BATCH = 500  # 調査で Table.GetArray により1回に読む行数
 
 Names = tuple[str, ...]
 
@@ -190,7 +191,9 @@ def _rows(folder) -> Iterator[tuple]:
     for c in COLUMNS:
         cols.Add(c)
     while not table.EndOfTable:
-        yield table.GetNextRow().GetValues()
+        # 1行ずつ GetNextRow するとプロセス間呼び出しが行数ぶん走るので、まとめて取る。
+        # GetArray は「行のタプル」のタプルを返す（a[行][列]。実機で確認済み。転置しない）
+        yield from table.GetArray(TABLE_BATCH) or ()
 
 
 class Outlook:

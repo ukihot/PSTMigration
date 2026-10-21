@@ -455,7 +455,7 @@ Phase 3 の直前に最終回収したい場合は、`config.json` を `"recolle
 | `work_dir` | `%LOCALAPPDATA%\PSTMigration\work` | 作業フォルダー。Cドライブが小さいPCは変更 |
 | `disk_factor` / `disk_reserve_gb` | 2.5 / 5 | 必要空き容量 = 元PSTサイズ × factor + reserve |
 | `logoff_snapshot_budget_gb` | 10 | 1回のログオフでコピーする合計上限（ログオフ待ちを抑える） |
-| `split_pause_ms` | 200 | 分割中、100件ごとの休み。Outlook が重いと言われたら増やす |
+| `split_pause_ms` | 200 | 分割中、最大500件のバッチごとの休み。Outlook が重いと言われたら増やす |
 | `release_wait_sec` | 900 | Outlook が出力PSTを手放すまで待つ秒数（パイロットで約9分かかった） |
 | `sevenzip_level` / `sevenzip_threads` | 5 / 2 | 7z の圧縮レベル・スレッド数 |
 | `transfer_max_mbps` | 50 | 1台あたりの転送帯域上限（0で無制限） |

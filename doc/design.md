@@ -229,9 +229,11 @@ OOMの `ReceivedTime` / `SentOn` は、それぞれMAPIプロパティ `PR_MESSA
 
 ## 5.3 調査（SCANNING）
 
-スナップショットの各メールフォルダーで `Folder.GetTable("", olUserItems)` を使い、以下の列を一括取得する（アイテムを1件ずつ開かない）。
+スナップショットの各メールフォルダーで `Folder.GetTable("", olUserItems)` を使い、以下の列を一括取得する（アイテムを1件ずつ開かない）。行は `Table.GetArray(500)` で500行ずつ読む。戻り値は `a[行][列]`（行のタプルのタプル）で、転置は不要（実機で確認）。
 
-`EntryID`, `MessageClass`, `PR_MESSAGE_DELIVERY_TIME`, `PR_CLIENT_SUBMIT_TIME`, `PR_MESSAGE_FLAGS`, `PR_TRANSPORT_MESSAGE_HEADERS`（有無判定のみ）, `PR_MESSAGE_SIZE`
+`EntryID`, `MessageClass`, `Subject`, `PR_MESSAGE_DELIVERY_TIME`, `PR_CLIENT_SUBMIT_TIME`, `PR_TRANSPORT_MESSAGE_HEADERS`（有無判定のみ）, `PR_MESSAGE_SIZE`
+
+新規の分割では、この調査で得たEntryIDをそのまま §5.4 の移動に使う（同じ調査を2回しない）。
 
 結果をフォルダー単位で `work\{pst_key}\scan.json` に保存する。
 
@@ -253,11 +255,14 @@ OOMの `ReceivedTime` / `SentOn` は、それぞれMAPIプロパティ `PR_MESSA
    - `old_mail_before_20210101_{PC名}.pst`
    - `new_mail_from_20210101_{PC名}.pst`
 2. スナップショットのフォルダー階層を出力PSTに再現（同名フォルダーがあれば再利用。`削除済みアイテム` は新規PSTに既定で存在する）。
-3. 調査結果のEntryIDごとに `GetItemFromID(entry_id, snapshot_store_id).Move(出力フォルダー)`。
+3. フォルダー単位で、Extended MAPI の `IMAPIFolder::CopyMessages(EntryID一覧, …, MESSAGE_MOVE)` により最大500件ずつまとめて移動する。
+   - OOMで1件ずつ `GetItemFromID(...).Move(...)` すると1件ごとにプロセス間呼び出しが2回走る（実測15ms/件、7万件で数十分）。`CopyMessages` は500件を1回の呼び出しで移す（実測2.1ms/件、約7倍。移動後に Outlook から見た件数も一致）。
+   - MAPIセッションは Outlook と同じプロファイルに `MAPILogonEx(MAPI_NEW_SESSION)` で別に張る。Outlook と同じビット数（64bit）の Python が必要。張れない・途中で失敗した場合は、残りを従来の `GetItemFromID(...).Move(...)` で1件ずつ移す。
    - **Copyではなく Move を使う。** 移動元はスナップショット（使い捨て）なので変更して構わず、`Copy()` の一時アイテム問題自体が発生しない。
-   - 100件ごとに `split_pause_ms` 待機し、OutlookのUI応答性を確保する（OOM呼び出しはOutlookのUIスレッドで処理されるため）。
-   - COMオブジェクトは1件ごとに解放する。
-4. 途中で中断された場合（ログオフ・Outlook終了・強制終了）、次回は既存の出力PSTとスナップショットをそのままマウントし、スナップショットに残っているアイテムを再調査して移動を再開する。Moveは「移動先へコピー→移動元から削除」なので、中断しても欠落はせず、最悪1件重複するだけである（重複は§5.5の検証で検出）。
+   - 500件ごとに `split_pause_ms` 待機し、OutlookのUI応答性を確保する。
+   - 分割の最後にMAPIセッションを閉じ、MAPIオブジェクトを全部解放する（残っているとPSTを掴み続ける）。
+4. 途中で中断された場合（ログオフ・Outlook終了・強制終了）、次回は既存の出力PSTとスナップショットをそのままマウントし、スナップショットに残っているアイテムを再調査して移動を再開する。Moveは「移動先へコピー→移動元から削除」なので、中断しても欠落はせず、最悪重複するだけである（重複は§5.5の検証で検出）。
+5. スナップショットを出力PSTとして流用する案（少ない側だけ移し、残りをリネーム）は採らない。PSTは中身を移しても物理サイズが縮まず（OOMに圧縮手段がない）、新PSTの転送量や旧7zの圧縮対象が増えて、MAPI一括移動後の短縮分を上回りうるため。
 
 ## 5.5 分割結果の検証（VERIFYING）
 

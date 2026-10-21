@@ -22,15 +22,22 @@ function Wait-OutlookExit($minutes, $msg) {
     }
 }
 
-if (Get-Process PSTMigration -ErrorAction SilentlyContinue) { Fail "PSTMigration が実行中です。終わってからもう一度実行してください。" }
-$ol = Get-Process OUTLOOK -ErrorAction SilentlyContinue
-if ($ol | Where-Object MainWindowHandle -ne 0) { Fail "Outlook を閉じてから実行してください。" }
-if ($ol) {
-    # 画面のない Outlook ＝ 途中で止めた PSTMigration が裏で起動した残り。普通に終了させる
+# 画面のない Outlook ＝ PSTMigration が裏で起動したもの。普通に終了させる
+# （強制終了はしない。ユーザーの元PSTも開いているので、壊さないため）
+function Stop-HeadlessOutlook {
+    $ol = Get-Process OUTLOOK -ErrorAction SilentlyContinue
+    if (-not $ol -or ($ol | Where-Object MainWindowHandle -ne 0)) { return }
     Step "裏で動いている Outlook を終了します"
     try { [Runtime.InteropServices.Marshal]::GetActiveObject("Outlook.Application").Quit() } catch {}
     Wait-OutlookExit 2 "Outlook が終了しません。タスクマネージャーで OUTLOOK.EXE を終了してから、もう一度実行してください。"
 }
+
+if (Get-Process PSTMigration -ErrorAction SilentlyContinue) { Fail "PSTMigration が実行中です。終わってからもう一度実行してください。" }
+if (Get-Process OUTLOOK -ErrorAction SilentlyContinue | Where-Object MainWindowHandle -ne 0) { Fail "Outlook を閉じてから実行してください。" }
+Stop-HeadlessOutlook
+
+$finished = $false
+try {
 
 # bin\config.json は GPO で上書きされるので、上限を外したコピーを別に作る
 $t = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "config.json"))
@@ -48,6 +55,16 @@ Run @("--snapshot", "--config", $cfg)
 
 Step "③ 分割 → 7z → NAS転送（数時間かかることがあります。Outlook は開いて使ってよい。PCはスリープ・シャットダウンしない）"
 Run @("--config", $cfg)
+$finished = $true
+} finally {
+    # Ctrl+C・途中のエラーで止まったとき：EXE と 7z を止め、裏の Outlook を終了させる（次回は続きから再開）
+    if (-not $finished) {
+        Write-Host "`n中断しました。後片付けをしています…" -ForegroundColor Yellow
+        Stop-Process -Name PSTMigration, 7z -Force -ErrorAction SilentlyContinue
+        Stop-HeadlessOutlook
+        Write-Host "後片付けが終わりました。もう一度実行すると、止めたところから再開します。" -ForegroundColor Yellow
+    }
+}
 
 Step "結果"
 $st = [IO.File]::ReadAllText((Join-Path $home_ "state.json")) | ConvertFrom-Json
