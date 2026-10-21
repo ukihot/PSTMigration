@@ -5,7 +5,7 @@
 #
 # 必要: uv、ビルドPC上の 7-Zip（7z.exe / 7z.dll を EXE に同梱するため。配布先PCには不要）
 #   7-Zip の場所は自動検出。見つからなければ SEVENZIP_DIR=/c/path/to/7-Zip を指定。
-# 出力: dist/PSTMigration/{PSTMigration.exe, config.json, 7-Zip-License.txt, SHA256SUMS.txt}
+# 出力: dist/PSTMigration/{PSTMigration.exe, config.json, PSTMigration-manual.cmd/.ps1, 7-Zip-License.txt, SHA256SUMS.txt}
 #   → config.json に NAS のパスワードを入れ、中身を \\<ドメイン名>\NETLOGON\PSTMigration\ に置く（設計書 §10.1）。
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -35,7 +35,7 @@ uv run pyinstaller --noconfirm --clean --onefile --noconsole \
 out=dist/PSTMigration
 rm -rf "$out"
 mkdir -p "$out"
-cp build/dist/PSTMigration.exe config.json "$out/"
+cp build/dist/PSTMigration.exe config.json scripts/PSTMigration-manual.cmd scripts/PSTMigration-manual.ps1 "$out/"
 [[ -f "$SEVENZIP_DIR/License.txt" ]] && cp "$SEVENZIP_DIR/License.txt" "$out/7-Zip-License.txt"
 (cd "$out" && sha256sum PSTMigration.exe config.json > SHA256SUMS.txt)
 

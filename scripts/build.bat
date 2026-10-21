@@ -25,6 +25,8 @@ if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%"
 copy /y build\dist\PSTMigration.exe "%OUT%\" >nul
 copy /y config.json "%OUT%\" >nul
+copy /y scripts\PSTMigration-manual.cmd "%OUT%\" >nul
+copy /y scripts\PSTMigration-manual.ps1 "%OUT%\" >nul
 if exist "%SEVENZIP_DIR%\License.txt" copy /y "%SEVENZIP_DIR%\License.txt" "%OUT%\7-Zip-License.txt" >nul
 
 pushd "%OUT%"

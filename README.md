@@ -200,7 +200,9 @@ New-Item -ItemType Directory \\192.168.8.120\PSTBackup\_slots -Force
 
 ## 3. 手動で動かす（GPO を待たずに試す・やり直す）
 
-GPO のタイミング（サインイン30分後・シャットダウン時）を待たずに、その場で各段階を動かせる。上の「どんな動きをするか」の①②③と対応している。
+**ふつうはこれだけ**：Outlook を閉じて、`%LOCALAPPDATA%\PSTMigration\bin\PSTMigration-manual.cmd` をダブルクリックする（GPO で EXE と一緒に配られている）。①検出 → ②コピー → ③分割・7z・転送 を続けて行い、最後に結果を表示する。ログオフ時のコピー上限（`logoff_snapshot_budget_gb`）を無視するので、上限を超える大きいPSTもこれで処理できる。③の間は Outlook を開いて使ってよいが、PC はスリープ・シャットダウンしない。
+
+各段階を個別に動かすときは次のとおり（上の「どんな動きをするか」の①②③と対応）。
 
 ```powershell
 $exe = "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe"
