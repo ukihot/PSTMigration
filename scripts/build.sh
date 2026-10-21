@@ -27,6 +27,7 @@ uv run pyinstaller --noconfirm --clean --onefile --noconsole \
   --name PSTMigration \
   --paths src \
   --hidden-import win32timezone \
+  --hidden-import win32comext.mapi.mapi \
   --add-binary "$sz\\7z.exe;." \
   --add-binary "$sz\\7z.dll;." \
   --distpath build/dist --workpath build/work --specpath build \

@@ -367,3 +367,78 @@ def test_cutoff_change_redoes_and_purges_old_generation(tmp_path):
 
     r._purge_stale(k1)
     assert not (nas / old_dir).exists() and k1["stale_remote_dirs"] == []
+
+
+# ---- 分割（MAPI 一括移動と、失敗時の1件ずつ移動） ---------------------------------
+
+
+def test_split_moves_in_batches_and_falls_back(monkeypatch):
+    import pywintypes
+
+    from pstmigration import outlook
+
+    class Folders:
+        def __init__(self):
+            self.d = {}
+
+        def Item(self, name):
+            if name not in self.d:
+                raise pywintypes.com_error(-1, "not found", None, None)
+            return self.d[name]
+
+        def Add(self, name, _type):
+            self.d[name] = Folder(name)
+            return self.d[name]
+
+    class Folder:
+        def __init__(self, name):
+            self.Name, self.EntryID, self.Folders = name, f"F-{name}-{id(self)}", Folders()
+
+    class Store:
+        def __init__(self, sid):
+            self.StoreID, self.root = sid, Folder("root")
+
+        def GetRootFolder(self):
+            return self.root
+
+    snap, old, new = Store("S"), Store("O"), Store("N")
+    snap.root.Folders.Add("受信トレイ", 0)
+    ids = {("受信トレイ",): {"old": [f"o{i}" for i in range(1200)], "new": ["n1", "n2"]}}
+
+    class Mover:
+        def __init__(self, fail_after):
+            self.calls, self.fail_after, self.closed = [], fail_after, False
+
+        def move(self, src_store, src_folder, dst_store, dst_folder, eids):
+            if len(self.calls) == self.fail_after:
+                raise pywintypes.com_error(-1, "MAPI error", None, None)
+            self.calls.append((dst_store, len(eids)))
+
+        def close(self):
+            self.closed = True
+
+    moved_each = []
+
+    class NS:
+        def GetItemFromID(self, eid, store_id):
+            class Item:
+                def Move(self, dest):
+                    moved_each.append(eid)
+
+            return Item()
+
+    ol = object.__new__(outlook.Outlook)
+    ol.ns = NS()
+
+    mover = Mover(fail_after=None)
+    monkeypatch.setattr(ol, "_mapi_mover", lambda: mover)
+    assert ol.split(snap, old, new, None, 0, ids) == 1202
+    assert mover.calls == [("O", 500), ("O", 500), ("O", 200), ("N", 2)] and mover.closed
+    assert moved_each == []
+    assert old.root.Folders.Item("受信トレイ") and new.root.Folders.Item("受信トレイ")  # 両方に同じ階層
+
+    mover = Mover(fail_after=1)  # 2回目の一括移動で失敗 → 残りは1件ずつ
+    monkeypatch.setattr(ol, "_mapi_mover", lambda: mover)
+    assert ol.split(snap, old, new, None, 0, ids) == 1202
+    assert mover.calls == [("O", 500)] and mover.closed
+    assert len(moved_each) == 700 + 2

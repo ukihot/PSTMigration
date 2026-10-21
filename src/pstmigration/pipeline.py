@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import msvcrt
 import os
@@ -252,6 +253,7 @@ class Runner:
         if self.ol is not None and self.ol.quit_if_headless():
             log.info("裏で起動した Outlook を終了しました（PSTを手放させるため）")
             self.ol = None
+            gc.collect()  # 残っている COM 参照を解放し、Outlook のプロセスを終わらせる
 
     def _ol_died(self) -> bool:
         if self.ol is not None and not self.ol.alive():
@@ -368,12 +370,12 @@ class Runner:
                 raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
-            ol = self._outlook()
-            store = ol.mount(pst, create=True, label="連絡先バックアップ")
+            # Outlook への参照をローカル変数に持たない（残っていると終了させても PST を手放さない）
+            store = self._outlook().mount(pst, create=True, label="連絡先バックアップ")
             try:
-                count = ol.export_contacts(store, self.cfg.work_path)
+                count = self.ol.export_contacts(store, self.cfg.work_path)
             finally:
-                ol.unmount(store)
+                self.ol.unmount(store)
                 del store
             self._let_go()
             if count:
@@ -480,8 +482,9 @@ class Runner:
         try:
             snap_store = ol.mount(snap, label=SNAPSHOT_LABEL)
             scan = read_json(work / SCAN, None)
+            ids = None  # 途中再開なら split() がスナップショットの残りを調べ直す
             if scan is None:  # 分割開始前の値を正解として固定する
-                scan, _ = ol.scan(snap_store, cutoff, log_subject=self.cfg.log_subject)
+                scan, ids = ol.scan(snap_store, cutoff, log_subject=self.cfg.log_subject)
                 write_json(work / SCAN, scan)
             e["counts"] = rules.totals(scan["folders"])
             e["folder_counts"] = rules.folder_counts(scan["folders"])
@@ -499,7 +502,8 @@ class Runner:
             t0 = time.monotonic()
             old_store = ol.mount(old_path, create=not old_path.exists(), label=f"旧メール（{label_date}より前）")
             new_store = ol.mount(new_path, create=not new_path.exists(), label=f"新メール（{label_date}以降）")
-            ol.split(snap_store, old_store, new_store, cutoff, self.cfg.split_pause_ms)
+            ol.split(snap_store, old_store, new_store, cutoff, self.cfg.split_pause_ms, ids)
+            del ids
             e["status"] = "VERIFYING"
             self.st.save()
             bad = ol.verify(snap_store, old_store, new_store, scan["folders"])
@@ -509,6 +513,7 @@ class Runner:
                 if s is not None:
                     ol.unmount(s)
 
+        del ol, s, snap_store, old_store, new_store  # 参照が残っていると Outlook が終了できない
         if bad:
             self._let_go()
             for p in (snap, old_path, new_path):

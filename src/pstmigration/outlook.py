@@ -7,6 +7,7 @@ Move などの書き込みはスナップショットと出力PSTに対しての
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import time
 from collections.abc import Iterator
@@ -49,7 +50,58 @@ _RETRY_HRESULTS = {-2147418111, -2147417846}  # RPC_E_CALL_REJECTED, RPC_E_SERVE
 
 MAX_PROBLEMS = 1000
 
+MESSAGE_MOVE = 0x1  # IMAPIFolder::CopyMessages のフラグ
+MOVE_BATCH = 500  # 1回の CopyMessages で移す件数（中断してもこの単位で続きから）
+
 Names = tuple[str, ...]
+
+
+class MapiMover:
+    """Extended MAPI の IMAPIFolder::CopyMessages で、メールをまとめて移動する。
+
+    Outlook の COM で1件ずつ Move すると、1件ごとにプロセス間呼び出しが2回（GetItemFromID・Move）走り、
+    7万件で約50分かかる。CopyMessages なら数百件を1回の呼び出しで PST 内部で移せる。
+    Outlook と同じプロファイルに別セッションでログオンする（Outlook と同じビット数の Python が必要）。
+    """
+
+    def __init__(self, profile: str):
+        from win32comext.mapi import mapi
+
+        self._mapi = mapi
+        mapi.MAPIInitialize(None)
+        try:
+            flags = mapi.MAPI_EXTENDED | mapi.MAPI_NO_MAIL | mapi.MAPI_NEW_SESSION
+            self._session = mapi.MAPILogonEx(0, profile, None, flags)
+        except Exception:
+            mapi.MAPIUninitialize()
+            raise
+        self._stores: dict[str, object] = {}
+        self._folders: dict[str, object] = {}
+
+    def _folder(self, store_id: str, folder_id: str):
+        f = self._folders.get(folder_id)
+        if f is None:
+            m = self._mapi
+            store = self._stores.get(store_id)
+            if store is None:
+                flags = m.MDB_WRITE | m.MDB_NO_DIALOG | m.MAPI_BEST_ACCESS
+                store = self._stores[store_id] = self._session.OpenMsgStore(0, bytes.fromhex(store_id), None, flags)
+            f = store.OpenEntry(bytes.fromhex(folder_id), None, m.MAPI_MODIFY | m.MAPI_BEST_ACCESS)
+            self._folders[folder_id] = f
+        return f
+
+    def move(self, src_store: str, src_folder: str, dst_store: str, dst_folder: str, eids: list[str]) -> None:
+        src, dst = self._folder(src_store, src_folder), self._folder(dst_store, dst_folder)
+        src.CopyMessages([bytes.fromhex(e) for e in eids], None, dst, 0, None, MESSAGE_MOVE)
+
+    def close(self) -> None:
+        self._folders.clear()
+        self._stores.clear()
+        with contextlib.suppress(pywintypes.com_error):
+            self._session.Logoff(0, 0, 0)
+        self._session = None
+        gc.collect()  # MAPI オブジェクトを全部解放してから終了しないと PST を掴み続ける
+        self._mapi.MAPIUninitialize()
 
 
 def _call(fn, *args):
@@ -343,26 +395,57 @@ class Outlook:
             folders.append(rec)
         return {"folders": folders, "problems": problems}, ids
 
-    def split(self, snap, old, new, cutoff_utc: datetime, pause_ms: int) -> int:
-        """スナップショットから出力PSTへ Move する（設計書 §5.4）。
+    def _mapi_mover(self) -> MapiMover | None:
+        try:
+            return MapiMover(self.ns.CurrentProfileName)
+        except Exception as e:  # 未同梱・Office とビット数が違う・MAPI 未登録など
+            log.warning("MAPI の一括移動が使えないため、1件ずつ移動します: %r", e)
+            return None
 
-        途中再開に対応：スナップショットに残っているものだけを再調査して移動する。
+    def _move_each(self, eids: list[str], store_id: str, dest) -> None:
+        for eid in eids:
+            try:
+                item = _call(self.ns.GetItemFromID, eid, store_id)
+            except pywintypes.com_error:
+                continue  # 失敗した一括移動で既に移っている。漏れがあれば verify で分かる
+            _call(item.Move, dest)
+            del item
+
+    def split(self, snap, old, new, cutoff_utc: datetime, pause_ms: int, ids: dict | None = None) -> int:
+        """スナップショットから出力PSTへ移動する（設計書 §5.4）。
+
+        ids は scan() の戻り値。無ければ（途中再開）スナップショットに残っているものを再調査する。
+        MAPI で MOVE_BATCH 件ずつまとめて移し、使えなければ Outlook の Move で1件ずつ移す。
         """
-        _, ids = self.scan(snap, cutoff_utc)
-        store_id = snap.StoreID
+        if ids is None:
+            _, ids = self.scan(snap, cutoff_utc)
+        sid = {"snap": snap.StoreID, "old": old.StoreID, "new": new.StoreID}
         roots = {"old": old.GetRootFolder(), "new": new.GetRootFolder()}
+        src_root = snap.GetRootFolder()
+        mover = self._mapi_mover()
         moved = 0
-        for names, buckets in ids.items():
-            # 空フォルダーも含め、全メールフォルダーを両方のPSTに作る（階層の維持）
-            dests = {b: _child(roots[b], names, create=True) for b in roots}
-            for bucket, eids in buckets.items():
-                for eid in eids:
-                    item = _call(self.ns.GetItemFromID, eid, store_id)
-                    _call(item.Move, dests[bucket])
-                    del item
-                    moved += 1
-                    if moved % 100 == 0:
-                        time.sleep(pause_ms / 1000)
+        try:
+            for names, buckets in ids.items():
+                # 空フォルダーも含め、全メールフォルダーを両方のPSTに作る（階層の維持）
+                dests = {b: _child(roots[b], names, create=True) for b in roots}
+                src_id = _child(src_root, names, create=False).EntryID
+                for bucket, eids in buckets.items():
+                    for i in range(0, len(eids), MOVE_BATCH):
+                        chunk = eids[i : i + MOVE_BATCH]
+                        if mover is not None:
+                            try:
+                                mover.move(sid["snap"], src_id, sid[bucket], dests[bucket].EntryID, chunk)
+                            except pywintypes.com_error as e:
+                                log.warning("MAPI の一括移動に失敗したため、1件ずつの移動に切り替えます: %s", e)
+                                mover.close()
+                                mover = None
+                        if mover is None:
+                            self._move_each(chunk, sid["snap"], dests[bucket])
+                        moved += len(chunk)
+                        time.sleep(pause_ms / 1000)  # Outlook の操作を妨げないよう少し譲る
+        finally:
+            if mover is not None:
+                mover.close()  # PST を掴んだまま Outlook から切り離さない
         log.info("移動 %d 件", moved)
         return moved
 

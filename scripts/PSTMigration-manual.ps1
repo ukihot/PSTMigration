@@ -37,7 +37,7 @@ $t = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "config.json"))
 $t = $t -replace '"logoff_snapshot_budget_gb"\s*:\s*[\d.]+', '"logoff_snapshot_budget_gb": 100000'
 [IO.File]::WriteAllText($cfg, $t)
 
-Step "① PSTを検出（Outlook を裏で起動します）"
+Step "① PSTを検出（途中で止まっていたPSTがあれば、その続きの分割・7z・転送もここで行うので数時間かかることがあります）"
 Run @("--config", $cfg)
 
 # ①で裏起動した Outlook が終わるのを待つ（起動中だとコピーできない）

@@ -15,7 +15,7 @@ uv run ruff check . || exit /b 1
 uv run ruff format --check . || exit /b 1
 uv run pytest -q || exit /b 1
 uv run pyinstaller --noconfirm --clean --onefile --noconsole --name PSTMigration --paths src ^
-  --hidden-import win32timezone ^
+  --hidden-import win32timezone --hidden-import win32comext.mapi.mapi ^
   --add-binary "%SEVENZIP_DIR%\7z.exe;." --add-binary "%SEVENZIP_DIR%\7z.dll;." ^
   --distpath build\dist --workpath build\work --specpath build ^
   src\pstmigration\__main__.py || exit /b 1
