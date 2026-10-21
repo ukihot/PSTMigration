@@ -23,7 +23,9 @@ from pstmigration.state import StepError
 log = logging.getLogger(__name__)
 
 OL_MAIL_ITEM = 0  # Folder.DefaultItemType
+OL_CONTACT_ITEM = 2
 OL_FOLDER_INBOX = 6  # Folders.Add の種別（メールフォルダー）
+OL_FOLDER_CONTACTS = 10
 OL_STORE_UNICODE = 2
 OL_NOT_EXCHANGE = 3
 OL_USER_ITEMS = 0
@@ -84,6 +86,28 @@ def walk(folder, names: Names = ()) -> Iterator[tuple[Names, object, str]]:
             continue
         yield n, f, kind
         yield from walk(f, n)
+
+
+def _contact_tops(folder) -> Iterator[object]:
+    """連絡先フォルダーのうち最上位のもの（CopyTo で配下ごとコピーされるため子は返さない）。"""
+    subs = folder.Folders
+    for i in range(1, subs.Count + 1):
+        f = subs.Item(i)
+        if _kind(f) == "search":
+            continue
+        try:
+            is_contact = f.DefaultItemType == OL_CONTACT_ITEM
+        except pywintypes.com_error:
+            is_contact = False
+        if is_contact:
+            yield f
+        else:
+            yield from _contact_tops(f)
+
+
+def _tree_count(folder) -> int:
+    subs = folder.Folders
+    return folder.Items.Count + sum(_tree_count(subs.Item(i)) for i in range(1, subs.Count + 1))
 
 
 def rel_path(names: Names) -> str:
@@ -235,6 +259,30 @@ class Outlook:
             if p and rules.norm_path(p).startswith(work):
                 log.info("残っていた作業用PSTを切り離します: %s", p)
                 self.unmount(s)
+
+    def export_contacts(self, dst, work_dir: Path) -> int:
+        """全ストアの連絡先フォルダーを dst へコピーし、件数を返す（元ストアは読むだけ）。
+
+        Exchange のストアはサーバ側にあるので対象外。IMAP の OST（このコンピューターのみ）は含める。
+        """
+        work = rules.norm_path(str(work_dir)) + "\\"
+        root = dst.GetRootFolder()
+        total = 0
+        for i, store in enumerate(list(self._stores()), 1):
+            path = self._path(store)
+            if not path or rules.norm_path(path).startswith(work) or store.ExchangeStoreType != OL_NOT_EXCHANGE:
+                continue
+            tops = list(_contact_tops(store.GetRootFolder()))
+            if not tops:
+                continue
+            # 同名の「連絡先」がストアごとにあるため、ストア単位のフォルダーに分ける
+            box = root.Folders.Add(f"{i}. {store.DisplayName}", OL_FOLDER_CONTACTS)
+            for f in tops:
+                n = _tree_count(f)
+                if _tree_count(_call(f.CopyTo, box)) != n:
+                    raise StepError("CONTACTS_MISMATCH", f"{store.DisplayName}\\{f.Name}: 元 {n} 件")
+                total += n
+        return total
 
     # ---- 調査・分割・検証 --------------------------------------------------
 

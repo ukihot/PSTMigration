@@ -201,6 +201,7 @@ def test_aggregate(tmp_path):
         return {
             "key": key,
             "source_path": rf"C:\{key}.pst",
+            "source_size": 20 * 1024**3 + 1024**3 // 2,
             "status": status,
             "checkpoint": checkpoint,
             "remote_dir": rf"users\{owner}\PC1\{key}_x",
@@ -236,6 +237,7 @@ def test_aggregate(tmp_path):
             return list(csv.DictReader(f))
 
     assert len(rows("ledger.csv")) == 4
+    assert rows("ledger.csv")[0]["source_gb"] == "20.5"
     purview = {r["FilePath"]: r for r in rows("purview_mapping_draft.csv")}
     assert set(purview) == {f"users/{taro}/PC1/a_x", f"users/{taro}/PC1/b_x", "users/hanako/PC1/d_x"}
     a = purview[f"users/{taro}/PC1/a_x"]
@@ -283,3 +285,31 @@ def test_aggregate_skips_missing_side(tmp_path):
     assert [r["FilePath"] for r in purview] == ["users/a@x.jp/PC1/only_new_x"]
     assert purview[0]["Note"] == ""  # 新PSTは1つだけなので MULTIPLE_UNITS にならない
     assert [r["path"] for r in rows("archive_list.csv")] == [r"users\a@x.jp\PC1\only_old_x\old.7z"]
+
+
+# ---- ログオフ時スナップショット ------------------------------------------------
+
+
+def test_snapshot_over_budget_warning_is_saved(tmp_path):
+    from pstmigration import pipeline
+    from pstmigration.state import State
+
+    src = tmp_path / "big.pst"
+    src.write_bytes(b"x" * 2048)
+    write_json(tmp_path / "state.json", {"psts": {"k": new_entry("k", str(src), False)}})
+    cfg = config.Config(logoff_snapshot_budget_gb=1 / 1024**3, work_dir=str(tmp_path / "work"))
+    pipeline.run_snapshot(cfg, tmp_path)
+    e = State(tmp_path / "state.json").psts["k"]
+    assert e["warnings"] == ["SNAPSHOT_OVER_BUDGET"] and e["snapshot_at"] is None
+
+
+def test_upload_overwrite_replaces_backup(tmp_path):
+    src, dst = tmp_path / "contacts.pst", tmp_path / "nas" / "contacts.pst"
+    dst.parent.mkdir()
+    dst.write_bytes(b"old")
+    (dst.parent / "contacts.pst.partial").write_bytes(b"stale")
+    src.write_bytes(b"new contacts")
+    with pytest.raises(StepError):
+        transfer.upload(src, dst, transfer.sha256_file(src), 0)  # 通常は上書きしない
+    transfer.upload(src, dst, transfer.sha256_file(src), 0, overwrite=True)
+    assert dst.read_bytes() == b"new contacts"

@@ -81,17 +81,22 @@ def slot(server_root: Path, wait_min: float) -> Iterator[None]:
         time.sleep(30)
 
 
-def upload(src: Path, dst: Path, sha256: str, max_mbps: float) -> None:
-    """一時名で転送→読み直してSHA-256照合→正式名へ。既存の正式名ファイルは上書きしない。"""
+def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: bool = False) -> None:
+    """一時名で転送→読み直してSHA-256照合→正式名へ。
+
+    既存の正式名ファイルは上書きしない。overwrite=True（毎回作り直すバックアップ用）なら置き換える。
+    """
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists():
+        part = dst.with_name(dst.name + ".partial")
+        if overwrite:
+            part.unlink(missing_ok=True)  # 前回の残りは中身が違うので続きからにしない
+        elif dst.exists():
             if sha256_file(dst) == sha256:
                 log.info("転送済み: %s", dst)
                 return
             raise StepError("REMOTE_CONFLICT", f"同名で内容の異なるファイルがあります: {dst}", final=True)
 
-        part = dst.with_name(dst.name + ".partial")
         size = src.stat().st_size
         offset = part.stat().st_size if part.exists() else 0
         if offset > size:
@@ -115,7 +120,10 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float) -> None:
         if sha256_file(part) != sha256:
             part.unlink()
             raise StepError("HASH_MISMATCH", f"転送後のSHA-256が一致しません: {dst}")
-        os.rename(part, dst)  # Windows の rename は既存ファイルを上書きしない
+        if overwrite:
+            os.replace(part, dst)
+        else:
+            os.rename(part, dst)  # Windows の rename は既存ファイルを上書きしない
         log.info("転送完了: %s", dst)
     except StepError:
         raise

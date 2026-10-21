@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import msvcrt
 import os
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 GB = 1024**3
 SNAPSHOT = "snapshot.pst"
 SCAN = "scan.json"
+CONTACTS_DIR = "contacts"  # 作業フォルダー内。PSTごとのフォルダー名（12桁の16進）とは重ならない
 SNAPSHOT_LABEL = "PSTMigration作業中（操作しないでください）"
 
 
@@ -89,7 +91,7 @@ def wait_released(path: Path, seconds: float) -> bool:
             transfer.open_exclusive(path).Close()
             return True
         except pywintypes.error as e:
-            if e.winerror == 2:  # ファイルなし
+            if e.winerror in (2, 3):  # ファイルなし・フォルダーなし
                 return True
             if time.monotonic() > deadline:
                 return False
@@ -139,9 +141,16 @@ def run_snapshot(cfg: Config, home: Path) -> None:
             size = src.stat().st_size
             if size > budget_total:
                 warn(e, "SNAPSHOT_OVER_BUDGET")  # 管理者が予算を上げるまで取らない
+                log.warning(
+                    "PST %s: %.1fGB が上限 %gGB を超えるためコピーしません",
+                    e["key"],
+                    size / GB,
+                    cfg.logoff_snapshot_budget_gb,
+                )
                 continue
             if size > budget:
-                continue  # 次回ログオフへ
+                log.info("PST %s: 今回の上限を使い切ったため次回ログオフへ", e["key"])
+                continue
             work = cfg.work_path / e["key"]
             work.mkdir(parents=True, exist_ok=True)
             _check_disk(work, rules.disk_needed(size, cfg.disk_factor, cfg.disk_reserve_gb))
@@ -165,7 +174,8 @@ def run_snapshot(cfg: Config, home: Path) -> None:
             apply_error(e, err, cfg.max_attempts)
         except OSError as ex:
             apply_error(e, StepError("SNAPSHOT_IO", str(ex), transient=True), cfg.max_attempts)
-        st.save()
+        finally:
+            st.save()  # continue でも警告を残す
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +228,8 @@ class Runner:
             self._resolve_mailbox()
             self._sync()
             self.st.data["last_run_error"] = None
+            if not self.scan_only:
+                self._backup_contacts()  # 小さいので、時間のかかる分割より先に
         except (StepError, pywintypes.com_error) as e:
             log.error("Outlook を利用できません: %s", e)
             self.st.data["last_run_error"] = {
@@ -262,7 +274,8 @@ class Runner:
                     e["skip_reason"] = d["skip"]
                 self.st.psts[d["key"]] = e
                 log.info("PST検出: %s (%s)", d["path"], d["skip"] or "対象")
-                continue
+            with contextlib.suppress(OSError):  # 毎回更新（上限超えで止まっているPSTを台帳で見つけるため）
+                e["source_size"] = os.stat(d["path"]).st_size
             e["is_default_store"] = d["is_default"]
             if e["status"] == "COMPLETED" and self.ol.live_counts(d["store"]) != e.get("folder_counts"):
                 if self.cfg.recollect_on_change:
@@ -280,6 +293,46 @@ class Runner:
                     )
                 else:
                     warn(e, "SOURCE_CHANGED")
+
+    # ---- 連絡先バックアップ（日付で分けず、毎回作り直して NAS 上を置き換える） ----
+
+    def _backup_contacts(self) -> None:
+        c = self.st.data.setdefault("contacts", {})
+        work = self.cfg.work_path / CONTACTS_DIR
+        pst = work / f"contacts_{_computer()}.pst"
+        try:
+            # 前回の残りは cleanup() で切り離し済み。Outlook が手放すのを待って作り直す
+            if not wait_released(pst, self.cfg.release_wait_sec):
+                raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True, exist_ok=True)
+            store = self.ol.mount(pst, create=True, label="連絡先バックアップ")
+            try:
+                count = self.ol.export_contacts(store, self.cfg.work_path)
+            finally:
+                self.ol.unmount(store)
+            if count:
+                if not wait_released(pst, self.cfg.release_wait_sec):
+                    raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
+                remote = PureWindowsPath("users", _owner(self.st.data), _computer(), pst.name)
+                transfer.upload(
+                    pst,
+                    self.cfg.server_path / remote,
+                    transfer.sha256_file(pst),
+                    self.cfg.transfer_max_mbps,
+                    overwrite=True,
+                )
+                c.update(remote_path=str(remote), size=pst.stat().st_size)
+            c.update(backup_at=now_iso(), count=count, last_error=None)
+            log.info("連絡先バックアップ: %d 件", count)
+            shutil.rmtree(work, ignore_errors=True)
+        except Exception as ex:  # 連絡先が失敗してもメール移行は続ける
+            if not self.ol.alive():
+                self.ol = None  # 残りの処理は次回ログオンで
+            code = getattr(ex, "code", "OUTLOOK_COM" if isinstance(ex, pywintypes.com_error) else "UNEXPECTED")
+            log.warning("連絡先バックアップに失敗: %s", ex, exc_info=code == "UNEXPECTED")
+            c["last_error"] = {"code": code, "message": str(ex)[:500], "at": now_iso()}
+        self.st.save()
 
     # ---- PST 1件 ---------------------------------------------------------
 

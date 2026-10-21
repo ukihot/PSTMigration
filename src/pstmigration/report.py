@@ -16,6 +16,7 @@ log = logging.getLogger(__name__)
 STATUS_KEYS = (
     "key",
     "source_path",
+    "source_size",
     "is_default_store",
     "status",
     "checkpoint",
@@ -76,6 +77,7 @@ def publish_status(server_root: Path, data: dict, user: str, computer: str) -> N
         "tool_version": __version__,
         "updated_at": now_iso(),
         "last_run_error": data.get("last_run_error"),
+        "contacts": data.get("contacts"),
         "psts": [{k: e.get(k) for k in STATUS_KEYS} for e in data["psts"].values()],
     }
     try:
@@ -108,6 +110,7 @@ def aggregate(root: Path) -> Path:
                     s["computer"],
                     p["key"],
                     p["source_path"],
+                    round(p["source_size"] / 1024**3, 2) if p.get("source_size") else None,
                     p.get("is_default_store"),
                     p["status"],
                     p.get("checkpoint"),
@@ -182,6 +185,7 @@ def aggregate(root: Path) -> Path:
             "computer",
             "pst_key",
             "source_path",
+            "source_gb",
             "is_default_store",
             "status",
             "checkpoint",
