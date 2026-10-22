@@ -462,3 +462,33 @@ def test_rows_reads_table_in_row_major_batches():
     table.GetArray = get_array
     folder = SimpleNamespace(GetTable=lambda *a: table)
     assert list(outlook._rows(folder)) == [("id1", "s1"), ("id2", "s2"), ("id3", "s3")]
+
+
+@pytest.mark.parametrize(
+    "started_here, windows, quits",
+    [
+        (True, 0, True),  # 本ツールが裏で起動し、画面も無い → 終了させる
+        (True, 1, False),  # 本ツールが起動したが、ユーザーが画面を開いた → 終了させない
+        (False, 0, False),  # ユーザーが起動した Outlook（画面が見えていなくても）→ 終了させない
+        (False, 1, False),
+    ],
+)
+def test_quit_only_outlook_started_by_this_tool(started_here, windows, quits):
+    from types import SimpleNamespace
+
+    from pstmigration import outlook
+
+    called = []
+    app = SimpleNamespace(
+        Explorers=SimpleNamespace(Count=windows), Inspectors=SimpleNamespace(Count=0), Quit=lambda: called.append(1)
+    )
+    ol = object.__new__(outlook.Outlook)
+    ol.app, ol.started_here = app, started_here
+    assert ol.quit_if_headless() is quits
+    assert bool(called) is quits
+
+
+def test_code_defaults_contain_no_credentials():
+    """NAS の資格情報は配布する config.json にだけ書く。ソース（公開リポジトリ）の既定値に書かない。"""
+    c = config.Config()
+    assert c.server_user == "" and c.server_password == ""

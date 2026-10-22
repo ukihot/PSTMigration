@@ -18,7 +18,7 @@ import pywintypes
 import win32con
 import win32file
 
-from pstmigration import report, rules, transfer
+from pstmigration import chunks, mapilive, report, rules, transfer
 from pstmigration.config import Config
 from pstmigration.state import (
     TERMINAL,
@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 GB = 1024**3
 SNAPSHOT = "snapshot.pst"
 SCAN = "scan.json"
+PLAN = "plan.json"  # ライブ分割の計画（§16.4）。その世代のあいだ変えない
 LEGACY_CUTOFF = "2021-01-01T00:00:00+09:00"  # 1.0.1 までは PST ごとに記録していない。当時配布した config の値
 CONTACTS_DIR = "contacts"  # 作業フォルダー内。PSTごとのフォルダー名（12桁の16進）とは重ならない
 SNAPSHOT_LABEL = "PSTMigration作業中（操作しないでください）"
@@ -98,7 +99,16 @@ def _restart(entry: dict, work: Path) -> None:
         last_error=None,
         warnings=[],
         generation=entry.get("generation", 1) + 1,
+        chunks=[],
+        split_mode=None,  # 次回の判定で決め直す
     )
+
+
+def _new_live_generation(entry: dict) -> None:
+    """ライブ分割を新しい世代でやり直す。前世代の NAS 上の束は、新世代の転送が済んでから消す（_purge_stale）。"""
+    if entry.get("remote_dir"):
+        entry.setdefault("stale_remote_dirs", []).append(entry["remote_dir"])
+    entry.update(remote_dir=None, chunks=[], generation=entry.get("generation", 1) + 1)
 
 
 def wait_released(path: Path, seconds: float) -> bool:
@@ -154,6 +164,8 @@ def run_snapshot(cfg: Config, home: Path) -> None:
     for e in st.psts.values():
         if e["status"] in TERMINAL or e.get("snapshot_at") or e.get("checkpoint"):
             continue
+        if e.get("split_mode") == "live":
+            continue  # ライブ分割（§16）はスナップショットを使わない
         src = Path(e["source_path"])
         try:
             size = src.stat().st_size
@@ -231,6 +243,61 @@ def _run_7z(args: list[str], cwd: Path, code: str) -> None:
         raise StepError(code, f"7z exit={r.returncode} {r.stderr.strip()[-500:]}")
 
 
+class LiveOps:
+    """ライブ分割（§16）で chunks.run_bucket に渡す本番の操作。束PST（mapilive）・7z・NAS（transfer）。"""
+
+    def __init__(self, cfg: Config, source, work: Path, remote: Path, mail_folders: list):
+        self.cfg, self.source, self.work, self.remote, self.mail_folders = cfg, source, work, remote, mail_folders
+
+    def free_bytes(self) -> int:
+        return shutil.disk_usage(self.work).free
+
+    def file_size(self, path: Path) -> int:
+        return path.stat().st_size if path.exists() else 0
+
+    def open_chunk(self, path: Path, first: bool):
+        folders = self.mail_folders if first else None  # 最初の束に空フォルダーを含む全階層
+        return mapilive.ChunkWriter(path, self.source, folders, pause_ms=self.cfg.split_pause_ms)
+
+    def rows(self, path: Path, need: set) -> list[dict]:
+        return mapilive.read_chunk(path, need)["rows"]
+
+    def pack(self, pst: Path) -> Path:
+        """7z にして 7z t に合格したら束PSTを消す（現行 §6 と同じ手順）。"""
+        c, archive = self.cfg, pst.with_suffix(".7z")
+        archive.unlink(missing_ok=True)
+        args = ["a", "-t7z", "-m0=lzma2", f"-mx={c.sevenzip_level}", f"-mmt={c.sevenzip_threads}", "-y"]
+        _run_7z([*args, archive.name, pst.name], pst.parent, "ARCHIVE_FAILED")
+        try:
+            _run_7z(["t", archive.name], pst.parent, "ARCHIVE_TEST_FAILED")
+        except StepError:
+            archive.unlink(missing_ok=True)
+            raise
+        pst.unlink()
+        return archive
+
+    def _nas(self, fn):
+        try:
+            return fn()
+        except OSError as e:
+            raise StepError("NETWORK", str(e), transient=True) from e
+
+    def remote_exists(self, name: str) -> bool:
+        return self._nas(lambda: (self.remote / name).exists())
+
+    def remote_sha(self, name: str) -> str | None:
+        p = self.remote / name
+        return self._nas(lambda: transfer.sha256_file(p) if p.exists() else None)
+
+    def remote_delete(self, name: str) -> None:
+        for p in (self.remote / name, self.remote / (name + ".partial")):
+            self._nas(lambda p=p: p.unlink(missing_ok=True))
+
+    def upload(self, local: Path, name: str, sha: str) -> None:
+        with transfer.slot(self.cfg.server_path, self.cfg.slot_wait_min):  # 束ごとに枠を取る（§16.11）
+            transfer.upload(local, self.remote / name, sha, self.cfg.transfer_max_mbps)
+
+
 class Runner:
     def __init__(self, cfg: Config, home: Path, scan_only: bool = False):
         self.cfg = cfg
@@ -240,6 +307,8 @@ class Runner:
         self.st = State(home / "state.json")
         self.ol = None  # 裏起動の Outlook を終了させた後は None（必要になったら _outlook() で起動し直す）
         self.ol_lost = False  # 処理中に Outlook が落ちた。残りは次回ログオンで
+        self.profile = None  # Outlook のプロファイル名（ライブ分割で元PSTを開くセッション用）
+        self._mapi_checked = None
 
     def _outlook(self):
         from pstmigration.outlook import Outlook  # COM はログオン時のみ
@@ -265,6 +334,8 @@ class Runner:
         ready = False
         try:
             self._outlook().cleanup(self.cfg.work_path)
+            self.profile = self.ol.ns.CurrentProfileName
+            self._cleanup_temp_profiles()
             self._resolve_mailbox()
             self._sync()
             self._apply_cutoff()
@@ -285,11 +356,7 @@ class Runner:
             for e in list(self.st.psts.values()):
                 if self.ol_lost:
                     break
-                if e["status"] in TERMINAL:
-                    continue
-                if not e.get("checkpoint") and not e.get("snapshot_at"):
-                    continue  # ログオフ時のスナップショット待ち
-                self._process(e)
+                self._process_entry(e)
                 self.st.save()
 
         report.publish_status(self.cfg.server_path, self.st.data, _user(), _computer())
@@ -319,6 +386,8 @@ class Runner:
             with contextlib.suppress(OSError):  # 毎回更新（上限超えで止まっているPSTを台帳で見つけるため）
                 e["source_size"] = os.stat(d["path"]).st_size
             e["is_default_store"] = d["is_default"]
+            with contextlib.suppress(pywintypes.com_error, AttributeError):
+                e["store_id"] = d["store"].StoreID  # ライブ分割で元PSTを MAPI で開くため
             if e["status"] == "COMPLETED" and self.ol.live_counts(d["store"]) != e.get("folder_counts"):
                 if self.cfg.recollect_on_change:
                     log.info("PST %s: 完了後に変更あり。再収集します", e["key"])
@@ -335,7 +404,7 @@ class Runner:
         for e in self.st.psts.values():
             if e["status"] == "SKIPPED":
                 continue
-            started = e.get("snapshot_at") or e.get("checkpoint") or e["status"] in TERMINAL
+            started = e.get("snapshot_at") or e.get("checkpoint") or e.get("chunks") or e["status"] in TERMINAL
             same = datetime.fromisoformat(e.get("cutoff") or LEGACY_CUTOFF) == self.cfg.cutoff_local
             if started and not same:
                 log.info("PST %s: cutoff が %s に変わったため作り直します", e["key"], self.cfg.cutoff)
@@ -357,6 +426,185 @@ class Runner:
                 continue
             log.info("PST %s: 旧 cutoff のフォルダーを削除: %s", e["key"], d)
             e["stale_remote_dirs"].remove(d)
+
+    def _process_entry(self, e: dict) -> None:
+        """PST 1件を、方式（スナップショット / ライブ分割）に応じて進める。"""
+        if e["status"] in TERMINAL:
+            return
+        if not self.scan_only and self._wants_live(e):  # 調査のみ（--scan-only）では束を作らない
+            self._process_live(e)
+        elif e.get("checkpoint") or e.get("snapshot_at"):
+            self._process(e)
+        # それ以外はログオフ時のスナップショット待ち、または保留
+
+    # ---- ライブ分割（設計書 §16） ------------------------------------------------
+
+    def _cleanup_temp_profiles(self) -> None:
+        """前回の異常終了で残った一時プロファイル（PSTMigration-tmp-*）を消す（§16.5.1）。"""
+        try:
+            with mapilive.Mapi():
+                removed = mapilive.cleanup_temp_profiles()
+        except Exception as ex:  # MAPI が使えない端末では何もしない
+            log.info("一時プロファイルの確認をスキップ: %r", ex)
+            return
+        if removed:
+            log.info("残っていた一時プロファイルを削除: %s", removed)
+
+    def _mapi_ok(self) -> bool:
+        """ユーザーのプロファイルへ MAPI の別セッションを張れるか（Office とビット数が合うか等）。"""
+        if self._mapi_checked is None:
+            try:
+                with mapilive.Mapi():
+                    mapilive.logon(self.profile).Logoff(0, 0, 0)
+                self._mapi_checked = True
+            except Exception as ex:
+                log.warning("MAPI のセッションを張れないため、ライブ分割を使えません: %r", ex)
+                self._mapi_checked = False
+        return self._mapi_checked
+
+    def _wants_live(self, e: dict) -> bool:
+        """このPSTをライブ分割で処理するか（§16.3）。スナップショット方式で進み始めたものは変えない。"""
+        if e.get("split_mode") == "live":
+            return True
+        if e.get("snapshot_at") or e.get("checkpoint"):
+            return False
+        c = self.cfg
+        self.cfg.work_path.mkdir(parents=True, exist_ok=True)
+        mode = rules.split_mode(
+            c.live_split,
+            int(e.get("source_size") or 0),
+            shutil.disk_usage(c.work_path).free,
+            self._mapi_ok(),
+            budget_bytes=int(c.logoff_snapshot_budget_gb * GB),
+            disk_factor=c.disk_factor,
+            reserve_bytes=int(c.disk_reserve_gb * GB),
+        )
+        if mode == "wait":
+            e["split_mode"] = None
+            apply_error(
+                e,
+                StepError("LIVE_SPLIT_UNAVAILABLE", "現行方式では処理できず、MAPI も使えない", transient=True),
+                c.max_attempts,
+            )
+            return False
+        e["split_mode"] = mode
+        return mode == "live"
+
+    def _limits(self) -> dict:
+        c = self.cfg
+        return {
+            "max": int(c.chunk_max_gb * GB),
+            "min": int(c.chunk_min_gb * GB),
+            "reserve": int(c.disk_reserve_gb * GB),
+            "factor": c.chunk_disk_factor,
+            "batch": int(c.batch_target_mb * 1024**2),
+            "batch_items": c.batch_items,
+            "plan_factor": c.plan_size_factor,
+        }
+
+    def _process_live(self, e: dict) -> None:
+        try:
+            self._live(e)
+        except Exception as ex:  # 想定外でも他のPSTの処理は続ける
+            apply_error(e, self._classify(e, ex), self.cfg.max_attempts)
+
+    def _live(self, e: dict) -> None:
+        work = self.cfg.work_path / e["key"]
+        plan = read_json(work / PLAN, None)
+        if plan is not None and plan.get("generation") != e.get("generation", 1):
+            plan = None  # --reset・cutoff 変更で世代が変わった
+        if plan is None:
+            if e.get("chunks"):  # 計画が失われたのに束の記録がある：新しい世代として別フォルダーに作り直す
+                _new_live_generation(e)
+            shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True, exist_ok=True)
+        if not e.get("remote_dir"):
+            stamp = datetime.now().strftime("%Y%m%d%H%M%S")
+            stem = Path(e["source_path"]).stem
+            e["remote_dir"] = str(
+                PureWindowsPath("users", _owner(self.st.data), _computer(), f"{stem}_{e['key']}_{stamp}")
+            )
+        cutoff = self.cfg.cutoff_utc
+        t0 = time.monotonic()
+        with mapilive.Mapi():
+            session = mapilive.logon(self.profile)
+            src = ops = None
+            try:
+                src = mapilive.open_user_store(session, e["store_id"])  # 読み取り専用（MDB_WRITE を付けない）
+                if plan is None:
+                    plan = self._live_plan(e, work, src, cutoff)
+                scan = read_json(work / SCAN, {"folders": [], "problems": []})
+                e["counts"] = rules.totals(scan["folders"])
+                e["folder_counts"] = rules.folder_counts(scan["folders"])
+                e["problems"] = scan["problems"]
+                e["status"] = "SPLITTING"
+                self.st.save()
+
+                planned = plan["items"]["old"] + plan["items"]["new"]
+                scanned = set(plan["scanned"])
+
+                def check_source(_chunk=None):
+                    """束を送り終えるたびと最後に、元PSTを調べ直す（§16.7）。"""
+                    failures, added = chunks.source_changes(planned, scanned, mapilive.scan(src, cutoff)["all_rows"])
+                    if failures:
+                        raise StepError("SOURCE_CHANGED_DURING_COPY", " / ".join(failures[:5]), final=True)
+                    return added
+
+                ops = LiveOps(self.cfg, src, work, self.cfg.server_path / e["remote_dir"], plan["mail_folders"])
+                records = e.setdefault("chunks", [])
+                need = {tuple(x) for x in plan["need"]}
+                prefixes = {"new": Path(self.names.new_pst).stem, "old": Path(self.names.old_pst).stem}
+                for b in ("new", "old"):
+                    chunks.run_bucket(
+                        b,
+                        plan["items"][b],
+                        records,
+                        ops,
+                        self.st.save,
+                        work=work,
+                        prefix=prefixes[b],
+                        need=need,
+                        limits=self._limits(),
+                        on_uploaded=check_source,
+                    )
+                problems = chunks.completion_problems(records, {b: len(plan["items"][b]) for b in ("new", "old")})
+                if problems:
+                    raise StepError("CHUNKS_INCOMPLETE", " / ".join(problems[:5]), final=True)
+                added = check_source()
+            finally:
+                src = ops = None  # MAPI オブジェクトを手放してからログオフ
+                with contextlib.suppress(Exception):
+                    session.Logoff(0, 0, 0)
+                session = None
+        if added:
+            e["source_added"] = added
+            warn(e, "SOURCE_CHANGED")  # 調査後に増えたメールは移行対象外。台帳で再回収の候補にする
+        _add_duration(e, "live", t0)
+        e["checkpoint"] = "TRANSFERRED"
+        self._finish(e, work)
+
+    def _live_plan(self, e: dict, work: Path, src, cutoff) -> dict:
+        """元PSTを調査して計画を固定する（§16.4）。計画とその調査結果は原子的に保存する。"""
+        e["status"] = "SCANNING"
+        e["chunks"] = []
+        self.st.save()
+        t0 = time.monotonic()
+        s = mapilive.scan(src, cutoff, log_subject=self.cfg.log_subject)
+        need = chunks.hash_needed(s["all_rows"])
+        for b in ("new", "old"):
+            mapilive.add_hashes(src, s["items"][b], need)
+        plan = {
+            "generation": e.get("generation", 1),
+            "cutoff": self.cfg.cutoff,
+            "items": s["items"],
+            "need": sorted(list(x) for x in need),
+            "scanned": [r["e"] for r in s["all_rows"]],
+            "mail_folders": s["mail_folders"],
+        }
+        write_json(work / SCAN, s["scan"])
+        write_json(work / PLAN, plan)
+        _add_duration(e, "scan", t0)
+        return plan
 
     # ---- 連絡先バックアップ（日付で分けず、毎回作り直して NAS 上を置き換える） ----
 
@@ -635,11 +883,16 @@ class Runner:
 
 
 def reset(home: Path, key: str) -> bool:
-    """管理者用：FAILED 等を PENDING に戻す（checkpoint は保持して続きから）。"""
+    """管理者用：FAILED 等を PENDING に戻す。
+
+    スナップショット方式は checkpoint を保持して続きから。ライブ分割は計画を捨てて新しい世代で作り直す（§16.7）。
+    """
     st = State(home / "state.json")
     e = st.psts.get(key)
     if e is None:
         return False
+    if e.get("split_mode") == "live":
+        _new_live_generation(e)
     e.update(status="PENDING", attempts=0, last_error=None)
     st.save()
     return True

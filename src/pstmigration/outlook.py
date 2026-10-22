@@ -196,9 +196,32 @@ def _rows(folder) -> Iterator[tuple]:
         yield from table.GetArray(TABLE_BATCH) or ()
 
 
+def _outlook_running() -> bool:
+    """このユーザーの OUTLOOK.EXE が動いているか（接続する前に調べる）。"""
+    import win32api
+    import win32con
+    import win32process
+
+    for pid in win32process.EnumProcesses():
+        try:
+            h = win32api.OpenProcess(win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        except pywintypes.error:
+            continue  # 他ユーザー・システムのプロセス
+        try:
+            if win32process.GetModuleFileNameEx(h, 0).lower().endswith("\\outlook.exe"):
+                return True
+        except pywintypes.error:
+            pass
+        finally:
+            h.Close()
+    return False
+
+
 class Outlook:
     def __init__(self) -> None:
         pythoncom.CoInitialize()
+        # 本ツールが起動した Outlook かどうか。ユーザーが起動した Outlook は、画面が見えていなくても終了させない
+        self.started_here = not _outlook_running()
         try:
             # 起動中ならそのインスタンス、未起動ならUIなしで起動される
             self.app = win32com.client.dynamic.Dispatch("Outlook.Application")
@@ -211,8 +234,10 @@ class Outlook:
         """本ツールが裏で起動した（画面のない）Outlook なら終了させ、True を返す。
 
         画面のない Outlook は、切り離したPSTも終了するまで掴み続ける（パイロットで確認）。
-        ユーザーが開いている Outlook は閉じない。
+        終了させるのは「本ツールが起動した」かつ「画面が無い」ときだけ（設計書 §16.5.1）。
         """
+        if not self.started_here:
+            return False
         try:
             if self.app.Explorers.Count or self.app.Inspectors.Count:
                 return False

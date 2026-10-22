@@ -29,6 +29,9 @@ STATUS_KEYS = (
     "warnings",
     "attempts",
     "last_error",
+    "split_mode",  # ライブ分割（§16）
+    "chunks",
+    "source_added",
 )
 
 PURVIEW_TARGET_ROOT = "/POP移行メール"
@@ -64,6 +67,9 @@ def build(entry: dict, status: str, data: dict, user: str, computer: str, folder
         "warnings": entry.get("warnings"),
         "errors": errors,
         "folders": folders,
+        "split_mode": entry.get("split_mode"),
+        "chunks": entry.get("chunks"),  # ライブ分割の束（名前・範囲・サイズ・SHA-256・サイズ差の分布）
+        "source_added": entry.get("source_added"),  # 調査後に増えたメール（移行対象外。再回収の候補）
     }
 
 
@@ -87,6 +93,18 @@ def publish_status(server_root: Path, data: dict, user: str, computer: str) -> N
         log.warning("status.json をサーバへ出力できません: %s", e)
 
 
+def _files(p: dict) -> list[tuple[str, dict, int | None]]:
+    """収集単位の出力ファイル: (new_pst か old_7z, {name, size, sha256}, 旧メールの件数)。
+
+    ライブ分割は束ごと（§16）、現行方式は1つずつ。0件の側はファイルが無い。
+    """
+    if p.get("chunks"):
+        ordered = sorted(p["chunks"], key=lambda c: (c["bucket"] != "new", c["seq"]))
+        return [("new_pst" if c["bucket"] == "new" else "old_7z", c, c["range"][1] - c["range"][0]) for c in ordered]
+    o, c = p.get("outputs") or {}, p.get("counts") or {}
+    return [(k, o[k], c.get("old") if k == "old_7z" else None) for k in ("new_pst", "old_7z") if k in o]
+
+
 def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -98,11 +116,12 @@ def aggregate(root: Path) -> Path:
     """全 status.json を集約して _admin\\ に台帳と後続作業用CSVを出す（設計書 §11.3、§11.4）。"""
     statuses = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(root.glob("users/*/*/status.json"))]
 
-    ledger, uploaded = [], []
+    ledger, uploaded, recollect = [], [], []
     for s in statuses:
         mailbox = s.get("mailbox") or ""
         for p in s["psts"]:
-            c, o, err = p.get("counts") or {}, p.get("outputs") or {}, p.get("last_error") or {}
+            c, err, files = p.get("counts") or {}, p.get("last_error") or {}, _files(p)
+            added = sum((p.get("source_added") or {}).values())
             ledger.append(
                 [
                     mailbox,
@@ -121,20 +140,26 @@ def aggregate(root: Path) -> Path:
                     c.get("new"),
                     c.get("unmigrated"),
                     c.get("non_mail"),
-                    (o.get("new_pst") or {}).get("size"),
-                    (o.get("old_7z") or {}).get("size"),
+                    sum(f["size"] for k, f, _ in files if k == "new_pst") if files else None,
+                    sum(f["size"] for k, f, _ in files if k == "old_7z") if files else None,
                     p.get("remote_dir"),
                     "|".join(p.get("warnings") or []),
                     s["updated_at"],
                     s["tool_version"],
+                    p.get("split_mode"),
+                    len(p.get("chunks") or []),
+                    added,
                 ]
             )
             if p.get("checkpoint") == "TRANSFERRED":
                 uploaded.append((mailbox or s["user"], s["computer"], p))
+            if added or "SOURCE_CHANGED" in (p.get("warnings") or []):
+                warnings = "|".join(p.get("warnings") or [])
+                recollect.append([mailbox, s["computer"], p["key"], p["source_path"], p["status"], added, warnings])
 
-    # 0件の側はファイルが無い（outputs にキーが無い）ので、ある分だけ一覧にする
-    with_new = [u for u in uploaded if "new_pst" in u[2]["outputs"]]
-    per_owner = Counter(owner for owner, _, _ in with_new)
+    # 0件の側はファイルが無いので、ある分だけ一覧にする。ライブ分割は束ごとに1行
+    with_new = [u for u in uploaded if any(k == "new_pst" for k, _, _ in _files(u[2]))]
+    per_owner = Counter(owner for owner, _, _ in with_new)  # 収集単位で数える（束の数ではない）
     purview, archives = [], []
     for owner, _, p in with_new:
         remote = PureWindowsPath(p["remote_dir"])
@@ -143,37 +168,31 @@ def aggregate(root: Path) -> Path:
             notes.append("MULTIPLE_UNITS")  # 1人に複数PST（複数PC・複数PST・再収集）
         if "@" not in owner:
             notes.append("MAILBOX_UNKNOWN")  # メールアドレスが取れなかった。手で記入
-        purview.append(
-            [
-                "Exchange",
-                remote.as_posix(),
-                p["outputs"]["new_pst"]["name"],
-                owner if "@" in owner else "",
-                "FALSE",
-                PURVIEW_TARGET_ROOT,
-                "",
-                "",
-                "",
-                "",
-                "|".join(notes),
-            ]
-        )
+        for kind, f, _ in _files(p):
+            if kind != "new_pst":
+                continue
+            purview.append(
+                [
+                    "Exchange",
+                    remote.as_posix(),
+                    f["name"],
+                    owner if "@" in owner else "",
+                    "FALSE",
+                    PURVIEW_TARGET_ROOT,
+                    "",
+                    "",
+                    "",
+                    "",
+                    "|".join(notes),
+                ]
+            )
     for owner, computer, p in uploaded:
-        o, c = p["outputs"], p.get("counts") or {}
-        if "old_7z" not in o:
-            continue
         remote = PureWindowsPath(p["remote_dir"])
-        archives.append(
-            [
-                owner,
-                computer,
-                str(remote / o["old_7z"]["name"]),
-                o["old_7z"]["size"],
-                o["old_7z"]["sha256"],
-                c.get("old"),
-                p["status"],
-            ]
-        )
+        for kind, f, old_count in _files(p):
+            if kind == "old_7z":
+                archives.append(
+                    [owner, computer, str(remote / f["name"]), f["size"], f["sha256"], old_count, p["status"]]
+                )
 
     out = root / "_admin"
     out.mkdir(exist_ok=True)
@@ -202,8 +221,16 @@ def aggregate(root: Path) -> Path:
             "warnings",
             "updated_at",
             "tool_version",
+            "split_mode",
+            "chunks",
+            "source_added",
         ],
         ledger,
+    )
+    _write_csv(
+        out / "recollect_candidates.csv",  # 調査後に増えたメールがある収集単位（移行直前の再回収の候補。§16.7）
+        ["mailbox", "computer", "pst_key", "source_path", "status", "source_added", "warnings"],
+        recollect,
     )
     _write_csv(
         out / "purview_mapping_draft.csv",

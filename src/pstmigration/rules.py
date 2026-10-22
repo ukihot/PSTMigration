@@ -136,3 +136,26 @@ def totals(folders: list[dict]) -> dict:
 def folder_counts(folders: list[dict]) -> dict[str, int]:
     """完了後の変更検出用：メールフォルダーごとの全アイテム数。"""
     return {f["path"]: f["old"] + f["new"] + f["unmigrated"] + f["non_mail"] for f in folders if f["kind"] == "mail"}
+
+
+def split_mode(
+    live_split: str,
+    size: int,
+    free: int,
+    mapi_ok: bool,
+    *,
+    budget_bytes: int,
+    disk_factor: float,
+    reserve_bytes: int,
+) -> str:
+    """'snapshot'（現行 §4〜§9）/ 'live'（§16）/ 'wait'（保留）。設計書 §16.3。
+
+    現行方式で処理できる（ログオフ時の上限内・空きも足りる）PSTは、新方式の検証が終わるまで現行を優先する。
+    現行で処理できないPSTは、MAPI が使えれば新方式。使えなければ容量の足りない現行方式へは戻さず保留。
+    """
+    snapshot_ok = size <= budget_bytes and free >= disk_needed(size, disk_factor, reserve_bytes / 1024**3)
+    if live_split == "always" and mapi_ok:
+        return "live"
+    if snapshot_ok:
+        return "snapshot"
+    return "live" if mapi_ok and live_split != "off" else "wait"

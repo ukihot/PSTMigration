@@ -14,8 +14,9 @@ class Config:
     cutoff: str = "2021-01-01T00:00:00+09:00"
     server_root: str = r"\\192.168.8.120\PSTBackup"
     # NAS は AD 非参加のため、NAS のローカルアカウントで接続する。空なら現在の資格情報のまま
-    server_user: str = "tokunaga"
-    server_password: str = "***REMOVED***"
+    # 資格情報は配布する config.json にだけ書く（ここに書くと公開リポジトリに載る）
+    server_user: str = ""
+    server_password: str = ""
     work_dir: str = r"%LOCALAPPDATA%\PSTMigration\work"
     disk_factor: float = 2.5
     disk_reserve_gb: float = 5
@@ -30,6 +31,14 @@ class Config:
     max_attempts: int = 3
     recollect_on_change: bool = False
     log_subject: bool = False
+    # ライブ分割方式（設計書 §16）
+    live_split: str = "auto"  # auto: 現行方式で処理できないPSTだけ / always / off
+    chunk_max_gb: float = 5
+    chunk_min_gb: float = 1
+    chunk_disk_factor: float = 2.5  # 束PST＋7z＋余裕。仮の値（パイロットで実測して決める）
+    batch_target_mb: float = 100  # 1回の CopyMessages の目標（PR_MESSAGE_SIZE の合計）
+    batch_items: int = 500
+    plan_size_factor: float = 1.15  # 計画・見積もり用。容量の保証には使わない
 
     def __post_init__(self) -> None:
         if self.cutoff_local.tzinfo is None:
@@ -38,6 +47,15 @@ class Config:
             raise ValueError("sevenzip_level は 0〜9")
         if self.disk_factor < 1 or self.max_attempts < 1 or self.sevenzip_threads < 1:
             raise ValueError("disk_factor / max_attempts / sevenzip_threads は 1 以上")
+        if self.live_split not in ("auto", "always", "off"):
+            raise ValueError("live_split は auto / always / off")
+        # 0 以下だと束のコピーが1件も進まず、無限ループになる
+        if self.batch_target_mb <= 0 or self.batch_items < 1:
+            raise ValueError("batch_target_mb は 0 より大きく、batch_items は 1 以上")
+        if not 0 < self.chunk_min_gb <= self.chunk_max_gb:
+            raise ValueError("0 < chunk_min_gb <= chunk_max_gb")
+        if self.chunk_disk_factor < 1 or self.plan_size_factor < 1:
+            raise ValueError("chunk_disk_factor / plan_size_factor は 1 以上")
 
     @property
     def cutoff_local(self) -> datetime:
