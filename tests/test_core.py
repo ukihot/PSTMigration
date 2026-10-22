@@ -445,7 +445,7 @@ def test_split_moves_in_batches_and_falls_back(monkeypatch):
 
 
 def test_rows_reads_table_in_row_major_batches():
-    """Table.GetArray は a[行][列] で返る（実機で確認）。転置せずに1行ずつ返すこと。"""
+    """Table.GetArray は a[行][列] で返る。転置せずに1行ずつ返すこと。"""
     from types import SimpleNamespace
 
     from pstmigration import outlook
@@ -489,6 +489,6 @@ def test_quit_only_outlook_started_by_this_tool(started_here, windows, quits):
 
 
 def test_code_defaults_contain_no_credentials():
-    """NAS の資格情報は配布する config.json にだけ書く。ソース（公開リポジトリ）の既定値に書かない。"""
+    """NAS の資格情報は config.json で渡す。コードの既定値は空。"""
     c = config.Config()
     assert c.server_user == "" and c.server_password == ""

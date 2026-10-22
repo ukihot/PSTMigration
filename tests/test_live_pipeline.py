@@ -259,3 +259,12 @@ def test_entry_dispatch(env, monkeypatch):
     e.update(status="COMPLETED")
     r._process_entry(e)  # 完了済みは何もしない
     assert called == ["live", "snapshot"]
+
+
+def test_off_setting_holds_large_pst_with_a_message_that_says_so(env, monkeypatch):
+    r, e, src, tmp = env
+    e.pop("split_mode")
+    r.cfg = config.Config(**{**r.cfg.__dict__, "live_split": "off"})
+    monkeypatch.setattr(r, "_mapi_ok", lambda: True)
+    assert r._wants_live(e) is False
+    assert e["last_error"]["code"] == "LIVE_SPLIT_UNAVAILABLE" and "live_split" in e["last_error"]["message"]

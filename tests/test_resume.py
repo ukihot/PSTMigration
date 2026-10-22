@@ -294,7 +294,7 @@ def test_row5_to_6_verified_chunk_that_fails_reverification_is_rebuilt(world):
 
 
 def test_row6_built_chunk_lost_locally_with_partial_on_nas_is_rebuilt_cleanly(world):
-    """NAS に前の束の .partial が残ったまま作り直すと、次の転送が HASH_MISMATCH で回数を消費する（M3 で発覚）。"""
+    """NAS に前の束の .partial が残ったまま作り直すと、次の転送が HASH_MISMATCH で回数を消費する。"""
     interrupt(world, "upload-partial")  # BUILT、NAS には .partial が半分
     (rec,) = [r for r in world.load() if r["status"] == "BUILT"]
     (world.work / rec["name"]).unlink()  # ローカルの束が消えた → 作り直し
@@ -566,7 +566,7 @@ def test_each_chunk_records_size_delta_distribution(world):
 
 
 def test_row4_to_6_built_chunk_damaged_locally_is_rebuilt_not_sent(world):
-    """BUILT の束が、SHA-256 を記録した後にローカルで壊れた。そのまま送らず作り直す（M9 で発覚した試験の穴）。"""
+    """BUILT の束が、SHA-256 を記録した後にローカルで壊れた。そのまま送らず作り直す。"""
     interrupt(world, "upload")  # BUILT を保存した直後、送る前に落ちた
     before = world.load()
     (rec,) = [r for r in before if r["status"] == "BUILT"]

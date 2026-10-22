@@ -149,7 +149,7 @@ def digest(parts) -> str:
     return h.hexdigest()
 
 
-# ---- MAPI（実環境。tests/integration で確認） ------------------------------------------
+# ---- MAPI ------------------------------------------------------------------------
 
 TEMP_PREFIX = "PSTMigration-tmp-"
 _seq = itertools.count(1)
@@ -236,7 +236,7 @@ class TempProfile:
         import pywintypes
 
         m = _mapi()
-        self.name = name or f"{TEMP_PREFIX}{os.getpid()}-{next(_seq)}"  # name はテスト用
+        self.name = name or f"{TEMP_PREFIX}{os.getpid()}-{next(_seq)}"  # 省略時は PSTMigration-tmp-{PID}-{連番}
         self._admin = m.MAPIAdminProfiles(0)
         self._admin.CreateProfile(self.name, None, 0, 0)
         self.session = None

@@ -60,8 +60,8 @@ Names = tuple[str, ...]
 class MapiMover:
     """Extended MAPI の IMAPIFolder::CopyMessages で、メールをまとめて移動する。
 
-    Outlook の COM で1件ずつ Move すると、1件ごとにプロセス間呼び出しが2回（GetItemFromID・Move）走り、
-    7万件で約50分かかる。CopyMessages なら数百件を1回の呼び出しで PST 内部で移せる。
+    Outlook の COM で1件ずつ Move すると、1件ごとにプロセス間呼び出しが2回（GetItemFromID・Move）走る。
+    CopyMessages なら数百件を1回の呼び出しで PST 内部で移せる。
     Outlook と同じプロファイルに別セッションでログオンする（Outlook と同じビット数の Python が必要）。
     """
 
@@ -192,7 +192,7 @@ def _rows(folder) -> Iterator[tuple]:
         cols.Add(c)
     while not table.EndOfTable:
         # 1行ずつ GetNextRow するとプロセス間呼び出しが行数ぶん走るので、まとめて取る。
-        # GetArray は「行のタプル」のタプルを返す（a[行][列]。実機で確認済み。転置しない）
+        # GetArray は行のタプルのタプル（a[行][列]）を返す
         yield from table.GetArray(TABLE_BATCH) or ()
 
 
@@ -233,7 +233,7 @@ class Outlook:
     def quit_if_headless(self) -> bool:
         """本ツールが裏で起動した（画面のない）Outlook なら終了させ、True を返す。
 
-        画面のない Outlook は、切り離したPSTも終了するまで掴み続ける（パイロットで確認）。
+        画面のない Outlook は、切り離したPSTも終了するまで掴み続ける。
         終了させるのは「本ツールが起動した」かつ「画面が無い」ときだけ（設計書 §16.5.1）。
         """
         if not self.started_here:

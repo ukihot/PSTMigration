@@ -92,7 +92,7 @@ def _match_key(r: dict, need: set[tuple]) -> tuple:
 def size_deltas(expected: list[dict], actual: list[dict], need: set[tuple]) -> dict[str, int]:
     """PR_MESSAGE_SIZE の差（束 − 元）の分布。照合キーが同じものどうしを小さい順に組にする。
 
-    合否には使わず記録する（2026-10-22 の実測は全件 +4 バイト。固定の仕様にはしない。§16.6）。
+    合否には使わず記録する（§16.6）。
     """
     want, got = defaultdict(list), defaultdict(list)
     for r in expected:
@@ -240,7 +240,7 @@ class _Side:
         for stale in (pst, pst.with_suffix(".7z")):  # 記録の無い作りかけ（前回この束の途中で落ちた）
             stale.unlink(missing_ok=True)
         end = self.copy_until_full(pst, start, target, first=seq == 1)
-        # 閉じると実ファイルサイズが増えうる。閉じた後の最終サイズで空きを確かめ直す（Windows 自体を守る）
+        # 閉じると実ファイルサイズが増えうるので、閉じた後の最終サイズで空きを確かめ直す
         pst_size = ops.file_size(pst)
         if ops.free_bytes() < lim["reserve"]:
             pst.unlink(missing_ok=True)

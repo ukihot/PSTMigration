@@ -1,6 +1,6 @@
 # PSTメールアーカイブ自動収集ツール 設計書
 
-- 文書版数：0.1（初版ドラフト）
+- 文書版数：1.1（大容量PST向けのライブ分割方式 §16 を追加）
 - 対象要件：[requirements.md](requirements.md) 版数1.0
 - システム名：PSTMigration
 
@@ -20,8 +20,10 @@
 
 | 出力 | 本ツールの到達点 | 後続作業（担当者が別途手作業で実施、スコープ外） |
 |---|---|---|
-| 旧メール `old_mail_before_20210101_{PC名}.7z` | ファイルサーバに配置・ハッシュ検証済み | SharePoint Online へ移す |
-| 新メール `new_mail_from_20210101_{PC名}.pst` | ファイルサーバに配置・ハッシュ検証済み | AzCopy でアップロードし Purview で Exchange Online へインポート |
+| 旧メール `old_mail_before_{cutoff日付}_{PC名}.7z` | ファイルサーバに配置・ハッシュ検証済み | SharePoint Online へ移す |
+| 新メール `new_mail_from_{cutoff日付}_{PC名}.pst` | ファイルサーバに配置・ハッシュ検証済み | AzCopy でアップロードし Purview で Exchange Online へインポート |
+
+`{cutoff日付}` は config の `cutoff`（§12）の日付（例 `20160221`）。ライブ分割方式（§16）では束ごとに `_001`, `_002` … を付ける。
 
 後続作業を楽にするため、保存先の構造（§8.2）と管理者向け集計出力（§11.4）をそれに合わせて設計する。
 
@@ -46,13 +48,16 @@
 
 | モード | 起動契機 | 起動方法 | 主な処理 | Outlook |
 |---|---|---|---|---|
-| 通常（引数なし） | ログオン後（遅延） | GPP スケジュールタスク | 検出・調査・分割・圧縮・転送・報告 | 使用 |
+| 通常（引数なし） | ログオン後（遅延） | GPP スケジュールタスク | 検出・調査・分割・圧縮・転送・報告。ライブ分割（§16）もこのモードで行う | 使用（ライブ分割の元PSTは MAPI の別セッション） |
 | `--snapshot` | ログオフ時 | GPO ログオフスクリプト | 元PSTのファイルスナップショット取得 | 不使用 |
 | `--aggregate <root>` | 管理者が手動 | 管理者PCから実行 | サーバ上の status.json を集約し、移行台帳と後続作業向けCSVを `_admin\` に出力（§11.4） | 不使用 |
 
-補助：`--scan-only`（分割せず件数調査のみ。試験・パイロット用）、`--version`。
+補助：`--scan-only`（分割せず件数調査のみ。試験・パイロット用。ライブ分割も行わない）、`--reset <pst_key>`（§9.3）、`--config <path>`、`--version`。
 
-**ログオフ時にスナップショットを取る理由は §4 を参照。** 結果として、1つのPSTは「ログオン（検出）→ ログオフ（スナップショット）→ 次回ログオン（分割〜転送）」の最短2回のログオンで完了する。
+PSTごとに処理方式を選ぶ（§16.3）。
+
+- **スナップショット方式（§4〜§9）**：ログオフ時のコピー上限以内で、空きも足りるPST。ログオフ時にスナップショットを取る理由は §4 を参照。1つのPSTは「ログオン（検出）→ ログオフ（スナップショット）→ 次回ログオン（分割〜転送）」の最短2回のログオンで完了する。
+- **ライブ分割方式（§16）**：上限を超える、または空きが足りないPST。ログオン時に元PSTを読み取り専用で開き、束ごとに作成〜転送する。1回のログオンで完了しうる。
 
 ## 2.2 配置
 
@@ -61,13 +66,18 @@
     bin\                  GPPファイルで配布（§10.1）
         PSTMigration.exe  7-Zip CLI（7z.exe / 7z.dll）を内蔵。各PCへの7-Zipインストール不要
         config.json
+        PSTMigration-manual.cmd / .ps1   手動実行用
         7-Zip-License.txt
     state.json            PST単位の処理状態（§9）
     logs\
-        run-YYYYMMDD-HHMMSS.jsonl
+        run-YYYYMMDD-HHMMSS-{PID}.jsonl
+    reports\              完了したPSTの report.json
     work\
-        {pst_key}\        PSTごとの作業フォルダー（§7）
+        {pst_key}\        PSTごとの作業フォルダー（§7。ライブ分割は §16）
+        contacts\         連絡先バックアップの作業フォルダー
 ```
+
+ライブ分割の束PSTは、本ツールが作る一時 MAPI プロファイル `PSTMigration-tmp-{PID}-{連番}`（束PST1つだけ。既定プロファイルにはしない）で開き、閉じるときに削除する（§16.5.1）。
 
 `work_dir` は config で変更可能（システムドライブが小さいPC向け）。OneDriveリダイレクト配下は不可とする。
 
@@ -92,10 +102,10 @@ sequenceDiagram
     L->>S: report.json / status.json 出力 (2.2-13)
 ```
 
+上はスナップショット方式。ライブ分割方式の流れは §16.2。
+
 ## 2.4 モジュール構成（Python）
 
-| モジュール | 責務 |
-|---|---|
 ソースは `src/pstmigration/`。
 
 | モジュール | 責務 |
@@ -103,13 +113,15 @@ sequenceDiagram
 | `__main__.py` | 引数解析・モード振り分け・多重起動防止・優先度設定・JSONログ |
 | `config.py` | config.json 読込・検証 |
 | `state.py` | state.json の原子的読み書き、状態遷移（`StepError`） |
-| `rules.py` | Outlook非依存の判定（日付分割、PSTヘッダー、容量計算、集計）。単体テスト対象 |
-| `outlook.py` | Outlook接続、PST検出、マウント／アンマウント、調査、分割、件数検証 |
-| `pipeline.py` | ログオフ時スナップショット、ログオン時の段階処理（7-Zip呼び出し含む） |
+| `rules.py` | Outlook非依存の判定（日付分割、PSTヘッダー、容量計算、集計、処理方式の選択） |
+| `outlook.py` | Outlook接続、PST検出、マウント／アンマウント、調査、分割、件数検証、連絡先のバックアップ |
+| `chunks.py` | ライブ分割の束：範囲・照合・作成〜転送・再開・完了判定・元PSTの変更検知（Outlook非依存） |
+| `mapilive.py` | ライブ分割の Extended MAPI：元PSTの読み取り専用オープン、一時プロファイル、移動なしのコピー、束の読み直し |
+| `pipeline.py` | ログオフ時スナップショット、ログオン時の段階処理（7-Zip呼び出し含む）、ライブ分割の組み立て |
 | `transfer.py` | SMB転送、帯域制御、同時転送枠、SHA-256照合 |
 | `report.py` | report.json / status.json、`--aggregate` |
 
-依存ライブラリ：pywin32 のみ（標準ライブラリ以外）。テストは `tests/`、ビルドは `scripts/build.sh`（Git Bash）または `scripts/build.bat`（cmd）。
+依存ライブラリ：実行時は pywin32 のみ（標準ライブラリ以外）。開発時は pyinstaller・pytest・hypothesis・ruff。テストは `tests/`（統合テストは `tests/integration/`、§16.15）、ビルドは `scripts/build.sh`（Git Bash）または `scripts/build.bat`（cmd）。
 
 ---
 
@@ -155,7 +167,7 @@ COMはプロセス外サーバのため、EXE（64bit）とOutlook（32/64bit）
 | B. ログオン中にファイルコピー | なし | **不可**（Outlookがロック。逆に当方がファイルを掴むとOutlookがPSTを開けなくなる） | 不可 | 大 | 不採用 |
 | C. ストア切り離し→コピー→再接続 | なし | 可 | **不可**（既定データファイルは切り離せない） | 中（一時的にナビゲーションから消える。異常終了時に切り離されたまま残る） | 不採用 |
 | D. `Folder.CopyTo()` で作業PSTへ複製 | なし（要検証） | 可 | 可 | **大**（大きいフォルダーのコピー中、OutlookのUIスレッドが長時間固まる） | 不採用 |
-| E. 拡張MAPIで自プロセスから直接読み出し | なし（読み取り専用で開く。実証済み） | 可 | 可 | 小 | 大容量PST向けに §16 で設計確定（未実装）。64bit Office 前提 |
+| E. 拡張MAPIで自プロセスから直接読み出し | なし（読み取り専用で開く。実証済み） | 可 | 可 | 小 | 大容量PST向けに §16 で採用（ライブ分割方式）。64bit Office 前提 |
 | **F. ログオフ時にファイルコピー** | **なし** | 該当なし（Outlook終了後） | 可 | 小（ログオフが数分延びる、初回のみ） | **採用** |
 
 ## 4.2 採用方式：ログオフ時スナップショット
@@ -225,7 +237,7 @@ OOMの `ReceivedTime` / `SentOn` は、それぞれMAPIプロパティ `PR_MESSA
 
 - 有効範囲は 1980-01-01〜2100-12-31。範囲外（1601年・4501年などの空値表現）は取得不能とみなす。
 - 日付取得不能 → 分割せずスナップショットに残し、`unmigrated` として記録（件名は記録しない。フォルダーパスとメッセージクラスのみ）。
-- **タイムゾーン**：MAPIの日時はUTC。基準日時は config の `cutoff`（`2021-01-01T00:00:00+09:00`）をUTC（`2020-12-31T15:00:00Z`）へ変換して比較する。比較は `日時 < cutoff` → 旧、`日時 >= cutoff` → 新。
+- **タイムゾーン**：MAPIの日時はUTC。基準日時は config の `cutoff`（例 `2016-02-21T00:00:00+09:00`）をUTC（`2016-02-20T15:00:00Z`）へ変換して比較する。比較は `日時 < cutoff` → 旧、`日時 >= cutoff` → 新。
 - 送受信の誤判定の影響は「送信日時と配信日時の差（通常数秒〜数分）」に限られ、基準日時をまたぐ場合のみ結果が変わる。確認用に基準日時 ±24時間のアイテム件数を report.json に記録する。
 
 ## 5.3 調査（SCANNING）
@@ -253,8 +265,8 @@ OOMの `ReceivedTime` / `SentOn` は、それぞれMAPIプロパティ `PR_MESSA
 ## 5.4 分割（SPLITTING）
 
 1. `work\{pst_key}\` に出力PSTを2つ作成（`AddStoreEx(path, olStoreUnicode)`）。
-   - `old_mail_before_20210101_{PC名}.pst`
-   - `new_mail_from_20210101_{PC名}.pst`
+   - `old_mail_before_{cutoff日付}_{PC名}.pst`
+   - `new_mail_from_{cutoff日付}_{PC名}.pst`
 2. スナップショットのフォルダー階層を出力PSTに再現（同名フォルダーがあれば再利用。`削除済みアイテム` は新規PSTに既定で存在する）。
 3. フォルダー単位で、Extended MAPI の `IMAPIFolder::CopyMessages(EntryID一覧, …, MESSAGE_MOVE)` により最大500件ずつまとめて移動する。
    - OOMで1件ずつ `GetItemFromID(...).Move(...)` すると1件ごとにプロセス間呼び出しが2回走る（実測15ms/件、7万件で数十分）。`CopyMessages` は500件を1回の呼び出しで移す（実測2.1ms/件、約7倍。移動後に Outlook から見た件数も一致）。
@@ -283,15 +295,15 @@ OOMの `ReceivedTime` / `SentOn` は、それぞれMAPIプロパティ `PR_MESSA
 
 ## 5.6 大容量の新メールPST（FR-05）
 
-`new_mail_from_20210101_{PC名}.pst` が `new_pst_warn_gb`（既定20GB）を超えた場合、処理は継続し report.json に警告 `NEW_PST_OVER_LIMIT` を記録する。自動再分割は要件どおり追加設計事項とする（年単位で出力PSTを分ける拡張を想定）。
+`new_mail_from_{cutoff日付}_{PC名}.pst` が `new_pst_warn_gb`（既定20GB）を超えた場合、処理は継続し report.json に警告 `NEW_PST_OVER_LIMIT` を記録する。自動再分割は要件どおり追加設計事項とする（年単位で出力PSTを分ける拡張を想定）。
 
 ---
 
 # 6. 圧縮（FR-04）
 
 ```
-7z.exe a -t7z -m0=lzma2 -mx=5 -mmt=2 -bso0 -bsp0 old_mail_before_20210101_{PC名}.7z old_mail_before_20210101_{PC名}.pst
-7z.exe t old_mail_before_20210101_{PC名}.7z
+7z.exe a -t7z -m0=lzma2 -mx=5 -mmt=2 -bso0 -bsp0 old_mail_before_{cutoff日付}_{PC名}.7z old_mail_before_{cutoff日付}_{PC名}.pst
+7z.exe t old_mail_before_{cutoff日付}_{PC名}.7z
 ```
 
 - 圧縮レベル・スレッド数は config で変更可能（既定 5 / 2）。スレッド数を絞り業務端末の負荷を抑える。
@@ -313,9 +325,9 @@ work\{pst_key}\
     snapshot.pst.partial   ログオフ時コピー中
     snapshot.pst           スナップショット
     scan.json              調査結果（分割の正解値）
-    old_mail_before_20210101_{PC名}.pst
-    new_mail_from_20210101_{PC名}.pst
-    old_mail_before_20210101_{PC名}.7z
+    old_mail_before_{cutoff日付}_{PC名}.pst
+    new_mail_from_{cutoff日付}_{PC名}.pst
+    old_mail_before_{cutoff日付}_{PC名}.7z
 ```
 
 ファイル名と state.json の状態で、どの段階で中断したかを判別できる。
@@ -374,8 +386,8 @@ work\{pst_key}\
             {COMPUTERNAME}\
                 status.json                         このPC・ユーザーの全PSTの状態（毎回上書き）
                 {pst_stem}_{pst_key}_{yyyyMMddHHmmss}\
-                    old_mail_before_20210101_{PC名}.7z     → 後で SharePoint へ
-                    new_mail_from_20210101_{PC名}.pst      → 後で Purview へ
+                    old_mail_before_{cutoff日付}_{PC名}.7z     → 後で SharePoint へ
+                    new_mail_from_{cutoff日付}_{PC名}.pst      → 後で Purview へ
                     report.json
     _slots\                                         同時転送枠（§8.4）
     _admin\                                         管理者の集計出力（§11.4）
@@ -582,24 +594,28 @@ stateDiagram-v2
 | ツールバージョン | `tool_version` |
 | 元PSTパス／サイズ | `source.path`, `source.size` |
 | 処理対象メール件数 | `counts.mail` |
-| 2020年以前／2021年以降 | `counts.old`, `counts.new` |
+| `cutoff` より前／以降 | `counts.old`, `counts.new` |
 | コピー成功件数 | `counts.moved_old + counts.moved_new` |
 | スキップ件数 | `counts.non_mail`, `counts.search_folder_items` |
 | エラー件数 | `counts.unmigrated`, `errors[]` の件数 |
 | 圧縮前容量／圧縮後容量／圧縮率 | `archive.pst_size`, `archive.size`, `archive.ratio` |
 | 転送先 | `remote_dir` |
 | SHA-256 | `outputs.*.sha256` |
-| 処理時間 | `durations.{scan,split,compress,transfer}_sec` |
+| 処理時間 | `durations.{snapshot,scan,split,compress,transfer,live}_sec` |
 | 最終ステータス | `status` |
 | エラー詳細 | `errors[]`（`code`, `phase`, `folder`, `message_class`, `message`） |
 
 追加：`is_default_store`, `pst_format`（ANSI/Unicode）, `counts.near_cutoff`, `warnings[]`, `folders[]`（フォルダー別件数）。
 
+ライブ分割（§16）：`split_mode`（`live`）、`chunks[]`（束ごとの `bucket`・`seq`・`name`・`range`・`size`・`sha256`・`pst_size`・`size_delta`）、`source_added`（調査後に増えたメールのフォルダー別件数）。束の出力ファイルは `outputs` ではなく `chunks[]` に入る。
+
 個人情報：件名・送信者・本文は記録しない（config `log_subject` を true にした場合のみ、エラー対象アイテムの件名を記録。障害解析用）。フォルダーパスは記録する。
 
 ## 11.3 移行台帳CSVの列
 
-`mailbox, mailbox_source, user, computer, pst_key, source_path, is_default_store, status, checkpoint, last_error_code, mail, old, new, unmigrated, non_mail, new_pst_size, archive_size, remote_dir, warnings, updated_at, tool_version`
+`mailbox, mailbox_source, user, computer, pst_key, source_path, source_gb, is_default_store, status, checkpoint, last_error_code, mail, old, new, unmigrated, non_mail, new_pst_size, archive_size, remote_dir, warnings, updated_at, tool_version, split_mode, chunks, source_added`
+
+`new_pst_size` / `archive_size` はライブ分割なら束の合計、`chunks` は束の数、`source_added` は調査後に増えたメールの件数の合計。
 
 `status = PENDING` かつ `updated_at` が古いものは「ログオフされずスナップショット未取得」の候補として抽出する。
 
@@ -610,11 +626,12 @@ stateDiagram-v2
 | ファイル | 内容 | 使い道 |
 |---|---|---|
 | `ledger.csv` | 移行台帳（§11.3） | 回収状況の把握・未完了PCの洗い出し |
-| `purview_mapping_draft.csv` | `COMPLETED` の新メールPSTごとに1行。Purview PSTインポートのマッピングCSV形式（`Workload,FilePath,Name,Mailbox,IsArchive,TargetRootFolder,...`）。`FilePath` は `users/{メールアドレス}/{PC}/{収集単位}`、`Name` は `new_mail_from_20210101_{PC名}.pst`、`Mailbox` はフォルダー名のメールアドレス、`TargetRootFolder` は `/POP移行メール` | Purviewインポート時のマッピングCSVのたたき台。アドレスが取れなかった行は `Mailbox` 空欄・備考 `MAILBOX_UNKNOWN` とし、担当者が記入する |
-| `archive_list.csv` | `COMPLETED` の旧メール7zごとに1行（ユーザー、PC、パス、サイズ、SHA-256、件数） | SharePointへ移した後の突き合わせ（件数・ハッシュ） |
+| `purview_mapping_draft.csv` | 転送済みの新メールPSTごとに1行（ライブ分割は束ごとに1行）。Purview PSTインポートのマッピングCSV形式（`Workload,FilePath,Name,Mailbox,IsArchive,TargetRootFolder,...`）。`FilePath` は `users/{メールアドレス}/{PC}/{収集単位}`、`Name` は `new_mail_from_{cutoff日付}_{PC名}.pst`、`Mailbox` はフォルダー名のメールアドレス、`TargetRootFolder` は `/POP移行メール` | Purviewインポート時のマッピングCSVのたたき台。アドレスが取れなかった行は `Mailbox` 空欄・備考 `MAILBOX_UNKNOWN` とし、担当者が記入する |
+| `archive_list.csv` | 転送済みの旧メール7zごとに1行（ライブ分割は束ごと。ユーザー、PC、パス、サイズ、SHA-256、件数） | SharePointへ移した後の突き合わせ（件数・ハッシュ） |
+| `recollect_candidates.csv` | `source_added` が1以上、または `SOURCE_CHANGED` 警告のある収集単位 | 移行直前の再回収（`recollect_on_change`）の対象の確認（§9.4、§16.7） |
 
-- AzCopy でアップロードする際は `users\` を起点に `--include-pattern "*.pst"` を指定すれば、新メールPSTだけがマッピングCSVの `FilePath` と同じ相対パスでアップロードされる。
-- 同一ユーザーに収集単位が複数ある場合（複数PST・複数PC・再収集）は、`purview_mapping_draft.csv` の備考列に `MULTIPLE_UNITS` と出す。インポート対象を担当者が選ぶ。
+- AzCopy でアップロードする際は `users\` を起点に `--include-pattern "new_mail_from_*.pst"` を指定すれば、新メールPSTだけがマッピングCSVの `FilePath` と同じ相対パスでアップロードされる（`*.pst` だと連絡先のバックアップ `contacts_{PC名}.pst` も含まれる）。
+- 同一ユーザーに収集単位が複数ある場合（複数PST・複数PC・再収集）は、`purview_mapping_draft.csv` の備考列に `MULTIPLE_UNITS` と出す。インポート対象を担当者が選ぶ。同じ収集単位の束どうしでは付けない。
 
 ---
 
@@ -622,14 +639,14 @@ stateDiagram-v2
 
 | キー | 既定値 | 説明 |
 |---|---|---|
-| `cutoff` | `"2021-01-01T00:00:00+09:00"` | 日付分割基準 |
+| `cutoff` | `"2021-01-01T00:00:00+09:00"` | 日付分割基準（配布値は `2016-02-21T00:00:00+09:00`。途中で変えた場合の扱いは §9） |
 | `server_root` | `"\\\\192.168.8.120\\PSTBackup"` | 転送先 |
-| `server_user` / `server_password` | `"pstmigration"` / `""` | NAS のローカルアカウント（§8.1）。`server_user` が空なら接続処理をしない |
+| `server_user` / `server_password` | `""` / `""` | NAS のローカルアカウント（§8.1）。配布する config.json に書く。`server_user` が空なら接続処理をしない |
 | `work_dir` | `"%LOCALAPPDATA%\\PSTMigration\\work"` | 作業フォルダー |
 | `disk_factor` | `2.5` | 必要空き容量の係数（§7.2） |
 | `disk_reserve_gb` | `5` | 必要空き容量の余裕分 |
 | `logoff_snapshot_budget_gb` | `10` | 1回のログオフで取るスナップショット合計上限 |
-| `split_pause_ms` | `200` | 分割時、100件ごとの待機 |
+| `split_pause_ms` | `200` | 分割時、1回のコピー（最大500件）ごとの待機 |
 | `release_wait_sec` | `900` | 出力PSTのハンドル解放待ち |
 | `sevenzip_level` | `5` | 圧縮レベル |
 | `sevenzip_threads` | `2` | 圧縮スレッド数 |
@@ -639,8 +656,13 @@ stateDiagram-v2
 | `max_attempts` | `3` | 決定的エラーの再試行上限 |
 | `recollect_on_change` | `false` | 完了後に元PSTが変わったら再収集するか |
 | `log_subject` | `false` | エラー時に件名を記録するか |
+| `live_split` | `"auto"` | ライブ分割（§16.3）。`auto` / `always` / `off`。リポジトリの雛形 config.json はパイロットが済むまで `off` |
+| `chunk_max_gb` / `chunk_min_gb` | `5` / `1` | 束の目標サイズの上限・下限（§16.5） |
+| `chunk_disk_factor` | `2.5` | 束の目標サイズに対して必要な空きの比率（§16.5） |
+| `batch_target_mb` / `batch_items` | `100` / `500` | 1回の `CopyMessages` の量の目標（§16.5） |
+| `plan_size_factor` | `1.15` | 束のサイズの見積もり用（§16.4） |
 
-config は起動時に検証し、不正なら何もせずログに記録して終了する。
+config は起動時に検証し、不正なら何もせずログに記録して終了する。書かなかったキーは既定値になる。
 
 ---
 
@@ -661,7 +683,7 @@ config は起動時に検証し、不正なら何もせずログに記録して�
 
 **新メール → Exchange Online（Purview）**
 1. `--aggregate` で `purview_mapping_draft.csv` を出力し、`Mailbox` 列を確認する（`MAILBOX_UNKNOWN` の行は記入）。`MULTIPLE_UNITS` の行はどれをインポートするか決める。
-2. AzCopy で `users\` を `--include-pattern "*.pst"` 付きでアップロードする。
+2. AzCopy で `users\` を `--include-pattern "new_mail_from_*.pst"` 付きでアップロードする。
 3. マッピングCSVでインポートジョブを作成する。`TargetRootFolder` は `/POP移行メール` のままにすることを推奨する。出力PSTの `受信トレイ` などがメールボックスの既定フォルダーに混ざらず、IMAP移行分との重複確認（要件5.3）もしやすい。
 
 **旧メール → SharePoint Online**
@@ -710,7 +732,7 @@ config は起動時に検証し、不正なら何もせずログに記録して�
 | 転送先権限不足・NASパスワード誤り | 分割・圧縮は進み、転送で RETRY_PENDING（NETWORK / ACCESS_DENIED） |
 | 元PSTの完全性 | 処理前後で元PSTのフォルダー別件数が一致。元PST内に「コピー」アイテムや削除済みアイテムの増加がないこと |
 
-自動テスト：日付判定（§5.2）、状態遷移（§9.3）、必要容量計算（§7.2）、転送の再開・ハッシュ照合（§8.3、ローカルフォルダーをSMB代わりにして実施）は Outlook 不要の単体テストとして用意する。
+自動テスト：日付判定（§5.2）、状態遷移（§9.3）、必要容量計算（§7.2）、転送の再開・ハッシュ照合（§8.3、ローカルフォルダーをSMB代わりにして実施）は Outlook 不要の単体テストとして用意する。ライブ分割のテストは §16.14・§16.15。
 
 ---
 
@@ -736,13 +758,13 @@ config は起動時に検証し、不正なら何もせずログに記録して�
 | 10.2 一時ディスク容量 | §7.2 |
 | 10.3 実行時間帯 | §2.1、§10.2、§10.3 |
 | 10.4 ファイルサーバ | §8.1、§8.4 |
-| 大容量PST（10GB超）の無人処理 | §16（設計確定・未実装） |
+| 大容量PST（10GB超）の無人処理 | §16 |
 
 ---
 
 # 16. ライブ分割方式（大容量PST向け）【実装済み・パイロット前】
 
-本章は2026-10-22に方針を承認し、同日 TDD で実装した（実装状況は §16.15）。単体テストと隔離PSTでの統合テストは通っているが、**社員PC・実データでのパイロットは未実施**である。§4〜§9 の現行方式（ログオフ時スナップショット）は、本章の統合試験とパイロットが成功するまで変更せずに運用する。
+本章は実装済みで（§16.15）、単体テストと隔離PSTでの統合テストは通っている。**社員PC・実データでのパイロットは未実施**である。§4〜§9 の現行方式（ログオフ時スナップショット）は、パイロットが成功するまで変更せずに運用する。配布する config.json はパイロットが済むまで `"live_split": "off"` とする。
 
 ## 16.1 目的と重要要件
 
@@ -785,7 +807,7 @@ flowchart LR
 | 上記を満たさず、MAPI が使える | **ライブ分割方式**（本章） |
 | 上記を満たさず、MAPI が使えない（Office とビット数が違う等） | 保留（`RETRY_PENDING`、理由 `LIVE_SPLIT_UNAVAILABLE`）。容量が足りない現行方式へは戻さない |
 
-- 新方式の検証完了後、config `live_split`（`auto` / `always` / `off`、既定 `auto`＝上表）で適用範囲を広げられるようにする。
+- 適用範囲は config `live_split` で切り替える。`auto`（既定）＝上表、`always`＝MAPI が使えれば全PST（使えなければ上表と同じ）、`off`＝使わない（現行方式で処理できないPSTは保留）。
 - ログオフ時スナップショットは、新方式の検証が完了するまで維持する。
 - Outlook 起動中の処理は条件付きで許可する（§16.7 の変更検知と再試行が前提）。ログオフ時はGPOの待ち時間（既定600秒）に収まらないため、本方式はログオン時タスクで実行する。
 
@@ -841,9 +863,8 @@ old_mail_before_{yyyyMMdd}_{PC名}_001.7z, _002.7z …   → SharePoint へ
 
 - **主判定：「フォルダーパス＋SearchKey＋指紋」の多重集合（件数込み）の一致。** 指紋は件名・配信日時・送信日時・メッセージクラス・添付の有無で、調査で読む内容テーブルの列から取れる（メールを1通ずつ開かない）。`PR_SEARCH_KEY` はコピーで保たれる（実証済み）が、別のメールが同じ値を持つことがあるため、集合ではなく件数込みで比べる。SearchKeyだけの多重集合では「A・B をコピーしたつもりが A・A になった」を見逃すが、A と B の指紋が違えば検出できる。
 - **SearchKey＋指紋まで重複する組の追加照合。** 元ストアの全行（全フォルダー、計画外の日付不明・非メールも含む）で「SearchKey＋指紋」が重複する組だけ、本文と添付データのハッシュを照合キーに加える。重複する組は少数のため、全メールに重い検証は掛けない。
-  - 組はフォルダーを問わずストア全体で判定する。PST の EntryID はストア全体で一意で、別フォルダーのメールも計画したフォルダーへコピーされうるため。フォルダー単位で判定していた初版は、別フォルダーの「SearchKey・指紋が同じで中身が違う」メールとの取り違えを見逃すことを、Hypothesis のプロパティテストで検出した（回帰テストを残して修正済み）。
+  - 組はフォルダーを問わずストア全体で判定する。PST の EntryID はストア全体で一意で、別フォルダーのメールも計画したフォルダーへコピーされうるため（フォルダー単位で判定すると、別フォルダーの「SearchKey・指紋が同じで中身が違う」メールとの取り違えを見逃す）。
   - ハッシュが必要な行でハッシュを計算できなかった場合は、一致しない扱いにする。
-  - 当初案（重複グループを1通ずつコピーし、増えた1行を対応付ける）は、上記で同等以上に検出できるため採らない。
 - フォルダー別件数の一致。
 - サイズ：コピー元とコピー先の `PR_MESSAGE_SIZE` の差を記録する（2026-10-22 の実測は全件 +4 バイト。**固定の仕様にはしない**）。合否判定に使う範囲（例：コピー先が小さい場合を不一致とするか）は、実データで分布を確認してから決める（§16.13）。
 - 不一致は `FAILED`。作りかけ・不一致の束はローカルで破棄する。
@@ -1022,14 +1043,6 @@ R2（ユーザー操作不要）と両立させるため、本方式では原本
 | レポート・status.json・台帳（束ごとの行、`source_added`、`recollect_candidates.csv`） | `report.py` | `test_live_report.py` |
 | 通し処理とプロセス強制終了からの復旧 | — | `tests/integration/test_live_e2e.py`（実 MAPI・実 7z。`TerminateProcess` で2回止めてから完了） |
 
-テストで見つかって直した不具合（いずれも再現テストを残した）：
-
-- 重複する組の判定をフォルダー単位で行っていたため、別フォルダーの「SearchKey・指紋が同じで中身が違う」メールとの取り違えを見逃していた（Hypothesis のプロパティテストで検出）。ストア全体で判定するよう修正。
-- ハッシュが必要な行で、期待側・束側ともハッシュが無いと一致扱いになっていた（レビューで指摘）。
-- 1回のコピーの件数が0だと無限ループになりうる（レビューで指摘）。config の読み込み時に検証。
-- 束を閉じた後に実ファイルサイズが増え、空きが予備を下回る場合を見ていなかった（レビューで指摘）。束を捨てて `DISK_SPACE` にする。
-- `--scan-only` でもライブ分割が動いていた。
-
-テストの検出力は、`chunks.py` に誤りを1つずつ入れた複製で確かめた（ミューテーション確認）。10種類の誤りのうち、結果が変わらない1種類（ローカルを消してから UPLOADED を保存する）を除く全部をテスト全体で検出した。ただし、Hypothesis の状態遷移テスト単体で検出できたのは一部で、複数の手順を経る経路（例：`.partial` を残して中断 → その束のローカルが消える → 再実行）は判定表の例のテストが検出している。
+テストの検出力は、`chunks.py` に誤りを1つずつ入れた複製でテストが失敗するかで確かめる（ミューテーション確認）。結果が変わらない誤り（ローカルを消してから UPLOADED を保存する、など）を除き、テスト全体で検出できること。複数の手順を経る経路（例：`.partial` を残して中断 → その束のローカルが消える → 再実行）は、Hypothesis の状態遷移テストだけでは探索しきれないことがあるため、§16.8 の判定表の各行を例のテストでも押さえる。
 
 統合テストでの実測：束のサイズ差は全件 +4 バイト（固定の仕様にはしない）。元PSTのファイル全体の SHA-256 は処理の前後で変わった（論理的な中身は一致。§16.13）。

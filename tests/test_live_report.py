@@ -11,7 +11,7 @@ def row(f, k, p, s, h=None):
 
 
 def test_size_deltas_pair_copies_within_each_identity():
-    """サイズ差（コピー先 − 元）の分布。合否には使わず記録する（実測 +4 バイト。仕様にはしない）。"""
+    """サイズ差（コピー先 − 元）の分布。合否には使わず記録する。"""
     expected = [row("受信", "A", "P", 10), row("受信", "A", "P", 20), row("送信", "B", "Q", 7)]
     actual = [row("受信", "A", "P", 24), row("受信", "A", "P", 14), row("送信", "B", "Q", 7)]
     assert chunks.size_deltas(expected, actual, set()) == {"4": 2, "0": 1}

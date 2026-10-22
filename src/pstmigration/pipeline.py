@@ -481,9 +481,10 @@ class Runner:
         )
         if mode == "wait":
             e["split_mode"] = None
+            why = "live_split=off" if c.live_split == "off" else "MAPI のセッションを張れない"
             apply_error(
                 e,
-                StepError("LIVE_SPLIT_UNAVAILABLE", "現行方式では処理できず、MAPI も使えない", transient=True),
+                StepError("LIVE_SPLIT_UNAVAILABLE", f"現行方式では処理できず、{why}", transient=True),
                 c.max_attempts,
             )
             return False

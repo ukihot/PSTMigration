@@ -102,11 +102,9 @@ def test_identical_fingerprints_are_told_apart_by_content_hash():
 
 
 def test_misplaced_copy_from_other_folder_with_same_key_and_fingerprint_is_detected():
-    """Hypothesis が見つけた見逃しの再現。
+    """別フォルダーにある「SearchKey・指紋が同じで中身が違う」メールが、計画したフォルダーへコピーされても検出する。
 
-    PST の EntryID はストア全体で一意なので、別フォルダーのメールが計画したフォルダーへコピーされうる。
-    別フォルダーに「SearchKey・指紋が同じで中身が違う」メールがあると、フォルダー単位で重複を見ていた
-    ハッシュ対象の判定から漏れ、取り違えを見逃していた。
+    PST の EntryID はストア全体で一意なので、別フォルダーのメールも計画したフォルダーへコピーされうる。
     """
     source = [row("受信", "X", "A"), row("受信", "X", "B"), row("送信", "X", "A")]
     need = chunks.hash_needed(source)
@@ -160,7 +158,7 @@ def _copy_case(draw):
 
 
 def test_missing_required_hash_fails():
-    """レビューで指摘：ハッシュが要る組で、期待側・実測側とも h が無いと None == None で合格していた。"""
+    """ハッシュが要る組で、期待側・束側ともハッシュが無い行は一致にしない。"""
     r = {"f": "Inbox", "k": "KEY-001", "p": ("subject", "date")}
     need = {("KEY-001", ("subject", "date"))}
     assert chunks.mismatches([r], [r], need)

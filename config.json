@@ -1,5 +1,5 @@
 {
-  "cutoff": "2021-01-01T00:00:00+09:00",
+  "cutoff": "2016-02-21T00:00:00+09:00",
   "server_root": "\\\\192.168.8.120\\PSTBackup",
   "server_user": "pstmigration",
   "server_password": "",
@@ -16,5 +16,6 @@
   "new_pst_warn_gb": 20,
   "max_attempts": 3,
   "recollect_on_change": false,
-  "log_subject": false
+  "log_subject": false,
+  "live_split": "off"
 }
