@@ -17,5 +17,5 @@
   "max_attempts": 3,
   "recollect_on_change": false,
   "log_subject": false,
-  "live_split": "off"
+  "live_split": "auto"
 }

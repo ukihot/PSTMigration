@@ -111,9 +111,9 @@ Get-Content $env:LOCALAPPDATA\PSTMigration\state.json -Encoding utf8 | Select-St
 | ✅ | 配布物を NETLOGON に置く | 済み（`\\tsuchiyoshi.private\NETLOGON\PSTMigration\`） |
 | ✅ | GPO `PSTMigration` | 適用中（68台で検出済み） |
 | ✅ | ふつうの方式 | 稼働中。TYCO248（20GB、手動実行）で完了を確認 |
-| ⏳ | ライブ分割 | 実装済み・単体／統合テスト済み。**社員PCでのパイロットは未実施**（[4-9](#4-9-ライブ分割のパイロット)） |
+| ⏳ | ライブ分割 | 1.2.0 で `live_split: auto` のまま全社配布（2026-10-22）。社員PCでの稼働を確認中（[4-9](#4-9-ライブ分割の様子を見る止める)） |
 
-10GB を超えるPSTが23個ある（2026-10-22 の集計）。これらはライブ分割のパイロットが済むまで、[手動実行](#3-手動で動かすgpo-を待たずに試すやり直す)で処理するか、保留にする。
+10GB を超えるPSTが23個ある（2026-10-22 の集計）。1.2.0 が届いたPCから、ライブ分割で処理される。
 
 ここから下は、作り直し・設定変更・トラブル時のための手順書。
 
@@ -141,7 +141,7 @@ lint（Ruff）→ テスト → EXE化 の順に走り、`dist/PSTMigration/` �
 7-Zip が自動検出できない場合：`SEVENZIP_DIR=/c/path/to/7-Zip scripts/build.sh`
 
 **NAS のパスワードは `dist\PSTMigration\config.json` に書く**。プロジェクト直下の `config.json`（git 管理）には書かない。
-再ビルドすると `dist\` は直下の `config.json` で上書きされるので、**ビルドのたびに入れ直してから** NETLOGON に置く。直下の `config.json` は配布値の雛形（`cutoff` は `2016-02-21T00:00:00+09:00`、`live_split` はパイロットが済むまで `off`）。
+再ビルドすると `dist\` は直下の `config.json` で上書きされるので、**ビルドのたびに入れ直してから** NETLOGON に置く。直下の `config.json` は配布値の雛形（`cutoff` は `2016-02-21T00:00:00+09:00`、`live_split` は `auto`）。
 
 ## 2. NAS と配布場所の準備（初回のみ）
 
@@ -386,21 +386,18 @@ Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
 
 フォルダーとファイルの項目（4-3）は残してもよい（EXE がPCに置かれるだけで、動かない）。
 
-### 4-9. ライブ分割のパイロット
+### 4-9. ライブ分割の様子を見る・止める
 
-`live_split` を `auto` にすると、10GB 超のPSTを持つ全PCでライブ分割が始まる。キーを書かないと `auto` になるので、**パイロットが済むまでは NETLOGON の `config.json` に `"live_split": "off"` を書いて配る**（雛形には入っている。大きいPSTは `LIVE_SPLIT_UNAVAILABLE` で保留になる）。
+`live_split` は `auto`（ふつうの方式で処理できないPSTを、自動でライブ分割する）で配っている。
 
-パイロットのPCでは、そのユーザーとしてサインインし、Outlook を起動したまま：
+様子を見る：
 
-```powershell
-$bin = "$env:LOCALAPPDATA\PSTMigration\bin"
-$cfg = "$env:LOCALAPPDATA\PSTMigration\config-pilot.json"
-$t = (Get-Content "$bin\config.json" -Raw -Encoding UTF8) -replace '"live_split"\s*:\s*"off"', '"live_split": "auto"'
-[IO.File]::WriteAllText($cfg, $t)   # BOM なしで保存
-Start-Process "$bin\PSTMigration.exe" -ArgumentList "--config",$cfg -Wait
-```
+- `--aggregate` の `ledger.csv` で `split_mode = live` の行の `status`・`chunks`・`last_error_code`。
+- NAS の収集単位フォルダーに束（`_001` …）が順に届いているか。
+- そのPCの `%LOCALAPPDATA%\PSTMigration\work\{key}\` に束がたまっていないか（作業中の1束だけのはず）。
+- [パイロットで確認すること](#パイロットで確認すること)のライブ分割の項目。
 
-[パイロットで確認すること](#パイロットで確認すること)のライブ分割の項目を見て、問題がなければ NETLOGON の `config.json` を `"live_split": "auto"` に戻して配る。
+止める：NETLOGON の `config.json` を `"live_split": "off"` にして配る。次のポリシー処理で各PCに届き、まだ始まっていない大きいPSTは `LIVE_SPLIT_UNAVAILABLE` で保留になる。処理中・処理済みのPST（`split_mode = live`）はそのまま続きを進めるので、完全に止めるには GPO のタスクを止める（[4-8](#4-8-回収が終わったらgpo-は残したまま止める)）。
 
 ### バージョンアップ
 
@@ -528,7 +525,7 @@ Start-Process "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe" -ArgumentLis
 | `max_attempts` | 3 | 一時的でないエラーの再試行上限 |
 | `recollect_on_change` | false | 完了後の変更で再収集するか |
 | `log_subject` | false | 日付取得不能メールの件名を report に残すか（障害解析時のみ true に） |
-| `live_split` | `auto` | ライブ分割。`auto`：ふつうの方式で処理できないPSTだけ / `always`：MAPI が使えれば全PST / `off`：使わない（[4-9](#4-9-ライブ分割のパイロット)） |
+| `live_split` | `auto` | ライブ分割。`auto`：ふつうの方式で処理できないPSTだけ / `always`：MAPI が使えれば全PST / `off`：使わない（[4-9](#4-9-ライブ分割の様子を見る止める)） |
 | `chunk_max_gb` / `chunk_min_gb` | 5 / 1 | 束の目標サイズの上限・下限。空きが少ないと上限より小さくし、下限を割るなら `DISK_SPACE` |
 | `chunk_disk_factor` | 2.5 | 束の目標サイズに対して必要な空きの比率（束PST＋7z＋余裕）。束の目標 =（空き − `disk_reserve_gb`）÷ この値 |
 | `batch_target_mb` / `batch_items` | 100 / 500 | 1回のコピー（`CopyMessages`）の量の目安（メールサイズの合計・件数） |
