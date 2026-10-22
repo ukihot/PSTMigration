@@ -80,6 +80,9 @@ class World:
     def file_size(self, path: Path) -> int:
         return path.stat().st_size if path.exists() else 0
 
+    def local_sha(self, path: Path) -> str:
+        return transfer.sha256_file(path)
+
     def open_chunk(self, path: Path, first: bool):
         self.opened.append((path.name, first))
         return Writer(self, path)

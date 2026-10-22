@@ -112,8 +112,9 @@ def _new_live_generation(entry: dict) -> None:
 
 
 def wait_released(path: Path, seconds: float) -> bool:
-    """Outlook がファイルを手放すまで待つ（設計書 §5.5）。"""
+    """Outlook・Windows Search 等がファイルを手放すまで待つ（設計書 §5.5）。"""
     deadline = time.monotonic() + seconds
+    logged = False
     while True:
         try:
             transfer.open_exclusive(path).Close()
@@ -121,6 +122,9 @@ def wait_released(path: Path, seconds: float) -> bool:
         except pywintypes.error as e:
             if e.winerror in (2, 3):  # ファイルなし・フォルダーなし
                 return True
+            if not logged:
+                log.info("ファイルの解放待ち（上限 %.0f 秒）: %s", seconds, path)
+                logged = True
             if time.monotonic() > deadline:
                 return False
             time.sleep(2)
@@ -260,10 +264,29 @@ class LiveOps:
         return mapilive.ChunkWriter(path, self.source, folders, pause_ms=self.cfg.split_pause_ms)
 
     def rows(self, path: Path, need: set) -> list[dict]:
+        self._wait_local(path)
         return mapilive.read_chunk(path, need)["rows"]
+
+    def _wait_local(self, path: Path, seconds: float | None = None) -> None:
+        if not wait_released(path, self.cfg.release_wait_sec if seconds is None else seconds):
+            raise StepError("PST_LOCKED", f"他のプロセスがファイルを解放しません: {path}", transient=True)
+
+    def local_sha(self, path: Path) -> str:
+        """照合で開き直したPSTも解放を待つ。確認直後の再ロックは同じ待機期限内で再試行。"""
+        deadline = time.monotonic() + self.cfg.release_wait_sec
+        while True:
+            self._wait_local(path, max(0, deadline - time.monotonic()))
+            try:
+                return transfer.sha256_file(path)
+            except PermissionError as ex:
+                if time.monotonic() >= deadline:
+                    raise StepError("PST_LOCKED", f"ファイルを読み取れません: {path}: {ex}", transient=True) from ex
+                log.info("SHA-256 計算時に再ロックされたため再試行: %s", path)
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
     def pack(self, pst: Path) -> Path:
         """7z にして 7z t に合格したら束PSTを消す（現行 §6 と同じ手順）。"""
+        self._wait_local(pst)
         c, archive = self.cfg, pst.with_suffix(".7z")
         archive.unlink(missing_ok=True)
         args = ["a", "-t7z", "-m0=lzma2", f"-mx={c.sevenzip_level}", f"-mmt={c.sevenzip_threads}", "-y"]
@@ -295,6 +318,7 @@ class LiveOps:
 
     def upload(self, local: Path, name: str, sha: str) -> None:
         with transfer.slot(self.cfg.server_path, self.cfg.slot_wait_min):  # 束ごとに枠を取る（§16.11）
+            self._wait_local(local)
             transfer.upload(local, self.remote / name, sha, self.cfg.transfer_max_mbps)
 
 
@@ -619,14 +643,8 @@ class Runner:
                 raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
-            # Outlook への参照をローカル変数に持たない（残っていると終了させても PST を手放さない）
-            store = self._outlook().mount(pst, create=True, label="連絡先バックアップ")
-            try:
-                count = self.ol.export_contacts(store, self.cfg.work_path)
-            finally:
-                self.ol.unmount(store)
-                del store
-            self._let_go()
+            sources = self._outlook().contact_sources(self.cfg.work_path)
+            count = mapilive.export_contacts(pst, self.profile, sources)
             if count:
                 if not wait_released(pst, self.cfg.release_wait_sec):
                     raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)

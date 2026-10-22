@@ -194,3 +194,54 @@ def test_leftover_temp_profiles_are_cleaned_up(mapi_env):
     removed = mapilive.cleanup_temp_profiles()
     assert removed and all(n.startswith(mapilive.TEMP_PREFIX) for n in removed)
     assert mapilive.profile_names() == before
+
+
+@pytest.mark.parametrize("failure", [None, "source", "folder"])
+def test_contacts_export_releases_pst_while_source_session_stays_open(mapi_env, monkeypatch, failure):
+    """元セッションを開いたまま、連絡先・配布リスト・子階層を別PSTへコピーする。"""
+    tp = mapilive.TempProfile(mapi_env / "contacts_source.pst", create=True)
+    pst = mapi_env / "contacts_backup.pst"
+    try:
+        w = tp.open_store(writable=True)
+        for path, cc, mclass, subject in [
+            ("\\連絡先", "IPF.Contact", "IPM.Contact", "田中"),
+            ("\\連絡先", "IPF.Contact", "IPM.DistList", "営業部"),
+            ("\\連絡先\\メモ", "IPF.Note", "IPM.Note", "補足"),
+            ("\\別の親\\連絡先", "IPF.Contact", "IPM.Contact", "鈴木"),
+        ]:
+            f = w.ensure_folder(path, cc)
+            add_message(f, mclass=mclass, subject=subject, attach=b"contact attachment")
+        w.ensure_folder("\\連絡先\\空", "IPF.Contact")
+        del w, f
+        sid = mapilive._query(tp.session.GetMsgStoresTable(0), (mapilive.PR_ENTRYID,))[0][0][1].hex()
+        sources = [{"store_id": sid, "name": "1. Legacy"}]
+        if failure == "source":
+            sources.append({"store_id": "invalid", "name": "2. Broken"})
+            with pytest.raises(ValueError):
+                mapilive.export_contacts(pst, tp.name, sources)
+        elif failure == "folder":
+            original = mapilive.MapiStore.ensure_folder
+
+            def broken(self, path, cc):
+                folder = original(self, path, cc)
+                if path.startswith("\\1. Legacy\\") and cc == "IPF.Note":
+                    raise RuntimeError("folder failure")
+                return folder
+
+            monkeypatch.setattr(mapilive.MapiStore, "ensure_folder", broken)
+            with pytest.raises(RuntimeError, match="folder failure"):
+                mapilive.export_contacts(pst, tp.name, sources)
+        else:
+            assert mapilive.export_contacts(pst, tp.name, sources) == 4
+        transfer.open_exclusive(pst).Close()
+        if failure is None:
+            got = mapilive.read_chunk(pst, set())
+            assert len(got["rows"]) == 4
+            assert "\\1. Legacy\\連絡先\\空" in got["folders"]
+            assert "\\1. Legacy\\連絡先 (2)" in got["folders"]
+            assert {r["p"].split("|")[0] for r in got["rows"]} == {"田中", "営業部", "補足", "鈴木"}
+        src = mapilive.open_user_store(tp.session, sid)
+        assert sum(len(src.rows(src.open(e))) for _, e, _, _ in src.walk()) == 4
+        del src
+    finally:
+        tp.close()

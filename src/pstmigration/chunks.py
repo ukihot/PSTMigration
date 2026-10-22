@@ -6,7 +6,6 @@ from collections import Counter, defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
-from pstmigration import transfer
 from pstmigration.state import StepError
 
 GB = 1024**3
@@ -135,6 +134,7 @@ def mismatches(expected: list[dict], actual: list[dict], need: set[tuple]) -> li
 #   free_bytes() / file_size(path) / open_chunk(path, first) -> writer(.copy(items), .close())
 #     first は各側の最初の束（_001）。空フォルダーを含む全階層をそこに作る
 #   rows(path, need) -> 束の中の行 / pack(pst) -> 7z（7z t 合格後に pst を消す）
+#   local_sha(path) -> 解放を待ってローカルファイルの SHA-256 を計算
 #   remote_exists(name) / remote_sha(name) / remote_delete(name)（正式名と .partial）/ upload(local, name, sha)
 # limits は bytes: max / min / reserve、比率: factor / plan_factor、1回のコピー: batch（bytes）/ batch_items
 
@@ -209,7 +209,7 @@ class _Side:
         if ops.remote_exists(name):  # 3
             ops.remote_delete(name)
         local = self.work / name
-        if r["status"] == BUILT and local.exists() and transfer.sha256_file(local) == r["sha256"]:  # 4
+        if r["status"] == BUILT and local.exists() and ops.local_sha(local) == r["sha256"]:  # 4
             self.upload(r)
             return
         pst = self.pst(r["seq"])
@@ -301,7 +301,7 @@ class _Side:
                 transient=True,
             )
         local = ops.pack(pst) if old else pst
-        r.update(status=BUILT, sha256=transfer.sha256_file(local), size=local.stat().st_size)
+        r.update(status=BUILT, sha256=ops.local_sha(local), size=local.stat().st_size)
         self.save()
         self.upload(r)
 

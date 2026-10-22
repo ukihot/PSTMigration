@@ -92,3 +92,30 @@ def test_classify_folder_rows_into_plan_items_and_report():
 def test_digest_is_unambiguous_about_part_boundaries():
     assert mapilive.digest([b"ab", b"c"]) != mapilive.digest([b"a", b"bc"])
     assert mapilive.digest([b"ab", b"c"]) == mapilive.digest([b"ab", b"c"])
+
+
+# ---- 連絡先バックアップのコピー計画（どのフォルダーを、どこへ） --------------------------------
+
+
+def test_contact_folders_are_copied_with_their_subfolders_under_one_box_per_store():
+    walk = [  # MapiStore.walk() の形：(パス, EntryID, 種類, コンテナークラス)
+        (r"\受信トレイ", b"1", "mail", "IPF.Note"),
+        (r"\連絡先", b"2", "other", "IPF.Contact"),
+        (r"\連絡先\取引先", b"3", "other", "IPF.Contact"),
+        (r"\連絡先\取引先\古い", b"4", "other", "IPF.Contact"),
+        (r"\予定表", b"5", "other", "IPF.Appointment"),
+        (r"\受信トレイ\社内アドレス帳", b"6", "other", "IPF.Contact"),  # メールフォルダーの下の連絡先
+        (r"\受信トレイ\社内アドレス帳\メモ", b"7", "mail", "IPF.Note"),  # 連絡先の下はメールでもコピー
+    ]
+    plan = mapilive.contact_copy_plan(walk, box="1. Legacy")
+    assert plan == [
+        (r"\連絡先", b"2", r"\1. Legacy\連絡先", "IPF.Contact"),
+        (r"\連絡先\取引先", b"3", r"\1. Legacy\連絡先\取引先", "IPF.Contact"),
+        (r"\連絡先\取引先\古い", b"4", r"\1. Legacy\連絡先\取引先\古い", "IPF.Contact"),
+        (r"\受信トレイ\社内アドレス帳", b"6", r"\1. Legacy\社内アドレス帳", "IPF.Contact"),
+        (r"\受信トレイ\社内アドレス帳\メモ", b"7", r"\1. Legacy\社内アドレス帳\メモ", "IPF.Note"),
+    ]
+
+
+def test_store_without_contact_folders_has_empty_plan():
+    assert mapilive.contact_copy_plan([(r"\受信トレイ", b"1", "mail", "IPF.Note")], box="2. IMAP") == []

@@ -12,10 +12,12 @@ import hashlib
 import itertools
 import os
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 from pstmigration import rules
+from pstmigration.state import StepError
 
 # 内容テーブルの列
 PR_ENTRYID = 0x0FFF0102
@@ -138,6 +140,30 @@ def classify_rows(path: str, raw_rows: list, cutoff_utc: datetime, *, log_subjec
                 p["subject"] = subject
             problems.append(p)
     return rec, items, all_rows, problems
+
+
+def contact_copy_plan(walk: list[tuple], *, box: str) -> list[tuple[str, bytes, str, str | None]]:
+    """連絡先バックアップでコピーするフォルダー：(元のパス, EntryID, コピー先のパス, コンテナークラス)。
+
+    最上位の連絡先フォルダー（祖先に連絡先フォルダーが無いもの）を配下ごと、コピー先の box フォルダーの直下に置く。
+    walk は MapiStore.walk() の戻り値（親から順）。
+    """
+    plan, tops = [], {}
+    used = set()
+    for path, eid, _kind, cc in walk:
+        top = next((t for t in tops if path == t or path.startswith(t + "\\")), None)
+        if top is None and (cc or "").upper().startswith("IPF.CONTACT"):
+            name = path.rsplit("\\", 1)[-1]
+            candidate, seq = name, 1
+            while candidate.casefold() in used:
+                seq += 1
+                candidate = f"{name} ({seq})"
+            used.add(candidate.casefold())
+            tops[path] = f"\\{box}\\{candidate}"
+            top = path
+        if top is not None:
+            plan.append((path, eid, tops[top] + path[len(top) :], cc))
+    return plan
 
 
 def digest(parts) -> str:
@@ -330,7 +356,7 @@ class MapiStore:
                     f = self._folders[sofar]
                     continue
                 f = f.CreateFolder(FOLDER_GENERIC, name, None, None, OPEN_IF_EXISTS)
-                if container_class:
+                if sofar == path and container_class:
                     f.SetProps([(PR_CONTAINER_CLASS_W, container_class)])
                     f.SaveChanges(0)
                 self._folders[sofar] = f
@@ -370,6 +396,53 @@ class MapiStore:
 def open_user_store(session, store_id: str) -> MapiStore:
     """ユーザーのプロファイルにある元PSTを、別セッションから読み取り専用で開く（MDB_WRITE を付けない）。"""
     return MapiStore(session.OpenMsgStore(0, bytes.fromhex(store_id), None, _mapi().MDB_NO_DIALOG), writable=False)
+
+
+def _copy_contacts(session, source: dict, dst: MapiStore) -> int:
+    src = sf = df = None
+    try:
+        src = open_user_store(session, source["store_id"])
+        total = 0
+        for path, eid, target, cc in contact_copy_plan(src.walk(), box=source["name"]):
+            sf = src.open(eid)
+            # 親の分類を子に引き継がせないため、ストア単位の箱は先に作る。
+            dst.ensure_folder("\\" + source["name"], "IPF.Contact")
+            df = dst.ensure_folder(target, cc)
+            eids = [value(r[0]) for r in _query(sf.GetContentsTable(0), (PR_ENTRYID,))]
+            for start in range(0, len(eids), QUERY_BATCH):
+                sf.CopyMessages(eids[start : start + QUERY_BATCH], None, df, 0, None, 0)
+            copied = len(_query(df.GetContentsTable(0), (PR_ENTRYID,)))
+            if copied != len(eids):
+                raise StepError("CONTACTS_MISMATCH", f"{source['name']}{path}: 元 {len(eids)} 件、コピー {copied} 件")
+            total += copied
+        return total
+    finally:
+        src = sf = df = dst = None  # 例外の traceback にも MAPI 参照を残さない
+
+
+def export_contacts(pst: Path, profile: str, sources: list[dict]) -> int:
+    """出力PSTは一時プロファイルだけに接続し、全参照を解放・ログオフしてから返す。"""
+    with Mapi():
+        session = logon(profile)
+        tp = dst = None
+        try:
+            tp = TempProfile(pst, create=True)
+            dst = tp.open_store(writable=True)
+            total = 0
+            for source in sources:
+                total += _copy_contacts(session, source, dst)
+            return total
+        except Exception as ex:
+            # _query や ensure_folder が失敗したフレームも MAPI 参照を保持しうる。
+            traceback.clear_frames(ex.__traceback__)
+            raise
+        finally:
+            dst = None
+            if tp is not None:
+                tp.close()
+            with contextlib.suppress(Exception):
+                session.Logoff(0, 0, 0)
+            session = None
 
 
 def scan(store: MapiStore, cutoff_utc: datetime, *, log_subject: bool = False) -> dict:

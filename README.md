@@ -48,6 +48,7 @@ PSTの中のメールは、config の `cutoff`（今の配布値は **2016-02-21
 - **1回やればおしまい**。完了したPSTは、以後のサインイン・シャットダウンでは何もしない（数秒で終わる）。
 - 途中で電源が切れても、次回のサインインで続きから再開する。
 - **連絡先は別扱い**：①のたびに、Outlook に見えている連絡先フォルダー（PST・IMAP の「このコンピューターのみ」。Exchange は除く）を `contacts_{PC名}.pst` にまとめ、NAS 上のものを置き換える。日付では分けない、常に最新のバックアップ。GPO を止める（[4-8](#4-8-回収が終わったらgpo-は残したまま止める)）と止まる。
+  出力PSTは一時MAPIプロファイルで作成するため、利用中の Outlook に接続されず、Outlook を閉じずにバックアップできる。コピー件数の照合とPSTの解放を確認してから NAS 上を置き換え、失敗した場合は前回のバックアップを残す。
 
 ### 待ち時間の目安（パイロット実測）
 
@@ -458,7 +459,7 @@ Start-Process .\PSTMigration.exe -ArgumentList "--aggregate","\\192.168.8.120\PS
 | `SOURCE_CHANGED_DURING_COPY` | ライブ分割の途中で、元PSTのメールが消された・移された | 即 FAILED。ユーザーに整理を止めてもらってから `--reset` |
 | `LIVE_SPLIT_UNAVAILABLE` | ふつうの方式で処理できず、ライブ分割も使えない（`live_split = off`、または MAPI のセッションを張れない） | `live_split` を見直す。MAPI なら Office のビット数（64bit 前提）を確認 |
 | `CHUNKS_INCOMPLETE` / `STATE_CORRUPT` | 束の記録が計画を覆っていない（通常は起きない） | ログ確認。`--reset` |
-| `PST_LOCKED` | Outlook（またはウイルス対策ソフト）が作業用PSTを手放さない | 次回ログオン時に続きから。放置でよい |
+| `PST_LOCKED` | Outlook・Windows Search・ウイルス対策ソフト等が作業用PSTを手放さない | 解放を待って続行。待機上限を超えた場合は次回ログオン時に続きから |
 | `OUTLOOK_LOST` | 処理中に Outlook が終了・クラッシュした（社員が閉じた等） | 次回ログオン時に続きから。放置でよい。同じPCで毎回続くなら Outlook のクラッシュをイベントログで確認 |
 | `ARCHIVE_FAILED` / `ARCHIVE_TEST_FAILED` | 7z 圧縮・テストの失敗 | ログの7z出力を確認。AppLocker で `%TEMP%` 実行禁止なら設計書 §10.1 |
 | `SLOT_BUSY` | 転送枠が空かない | スロットを増やすか放置 |
@@ -517,7 +518,7 @@ Start-Process "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe" -ArgumentLis
 | `disk_factor` / `disk_reserve_gb` | 2.5 / 5 | ふつうの方式の必要空き容量 = 元PSTサイズ × factor + reserve。`disk_reserve_gb` はライブ分割でも Windows 用に残す空き |
 | `logoff_snapshot_budget_gb` | 10 | 1回のログオフでコピーする合計上限（ログオフ待ちを抑える）。超えるPSTはライブ分割の対象 |
 | `split_pause_ms` | 200 | 分割中、1回のコピー（最大500件）ごとの休み。Outlook が重いと言われたら増やす |
-| `release_wait_sec` | 900 | Outlook が出力PSTを手放すまで待つ秒数（パイロットで約9分かかった） |
+| `release_wait_sec` | 900 | Outlook・Windows Search 等が出力PSTを手放すまで待つ秒数。ライブ分割の照合・ハッシュ計算・圧縮・転送前にも適用 |
 | `sevenzip_level` / `sevenzip_threads` | 5 / 2 | 7z の圧縮レベル・スレッド数 |
 | `transfer_max_mbps` | 50 | 1台あたりの転送帯域上限（0で無制限） |
 | `slot_wait_min` | 30 | 転送枠の空き待ち上限 |

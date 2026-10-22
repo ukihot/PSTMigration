@@ -4,8 +4,10 @@ MAPI（mapilive）と 7z だけ偽物にする。NAS はローカルフォルダ
 """
 
 import contextlib
+import dataclasses
 import json
 import os
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -238,6 +240,117 @@ def test_step_error_is_not_swallowed_as_unexpected(env):
     src.on_copy = boom
     r._process_live(e)
     assert e["status"] == "RETRY_PENDING" and e["last_error"]["code"] == "DISK_SPACE"
+
+
+@pytest.mark.parametrize("bucket", ["new", "old"])
+def test_locked_verified_chunk_is_retained_and_resumed_without_recopy(env, monkeypatch, bucket):
+    r, e, src, tmp = env
+    src.mails = [m for m in src.mails if m["bucket"] == bucket]
+    waits = []
+
+    def locked(path, seconds):
+        waits.append(path)
+        return len(waits) == 1  # 照合後に検索インデックス処理が開く
+
+    monkeypatch.setattr(pipeline, "wait_released", locked)
+    r._process_live(e)
+    assert e["status"] == "RETRY_PENDING" and e["last_error"]["code"] == "PST_LOCKED"
+    assert waits
+    assert e["chunks"][0]["status"] == "VERIFIED"
+    assert waits[0].exists() and not nas_files(tmp)
+    first = e["chunks"][0].copy()
+    monkeypatch.setattr(pipeline, "wait_released", lambda *a: True)
+    copies = []
+    src.on_copy = lambda: copies.append(1)
+    r._process_live(e)
+    assert e["status"] == "COMPLETED"
+    assert e["chunks"][0]["range"] == first["range"]
+    assert len(copies) == len(e["chunks"]) - 1
+
+
+def test_live_hash_retries_if_file_is_locked_again_after_release(env, monkeypatch):
+    r, _, _, tmp = env
+    r.cfg = dataclasses.replace(r.cfg, release_wait_sec=5)
+    ops = pipeline.LiveOps(r.cfg, None, tmp, tmp / "nas", [])
+    pst = tmp / "test.pst"
+    pst.write_bytes(b"pst")
+    original = pipeline.transfer.sha256_file
+    calls = []
+
+    def hash_file(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise PermissionError(13, "locked again")
+        return original(path)
+
+    monkeypatch.setattr(pipeline, "wait_released", lambda *a: True)
+    monkeypatch.setattr(pipeline.transfer, "sha256_file", hash_file)
+    assert ops.local_sha(pst) == original(pst)
+    assert len(calls) == 2
+
+
+def test_built_chunk_keeps_state_when_locked_during_resume(env, monkeypatch):
+    r, e, src, tmp = env
+    original = pipeline.LiveOps.upload
+    monkeypatch.setattr(pipeline.LiveOps, "upload", lambda *a: (_ for _ in ()).throw(Crash()))
+    with pytest.raises(Crash):
+        r._process_live(e)
+    assert e["chunks"][0]["status"] == "BUILT"
+    monkeypatch.setattr(pipeline.LiveOps, "upload", original)
+    monkeypatch.setattr(pipeline, "wait_released", lambda *a: False)
+    r._process_live(e)
+    assert e["status"] == "RETRY_PENDING" and e["last_error"]["code"] == "PST_LOCKED"
+    assert e["chunks"][0]["status"] == "BUILT"
+    monkeypatch.setattr(pipeline, "wait_released", lambda *a: True)
+    r._process_live(e)
+    assert e["status"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("release", [True, False])
+def test_live_hash_handles_real_windows_sharing_lock(env, monkeypatch, release):
+    r, _, _, tmp = env
+    r.cfg = dataclasses.replace(r.cfg, release_wait_sec=3 if release else 0)
+    ops = pipeline.LiveOps(r.cfg, None, tmp, tmp / "nas", [])
+    pst = tmp / "externally_locked.pst"
+    pst.write_bytes(b"external process")
+    expected = pipeline.transfer.sha256_file(pst)
+    handle = pipeline.transfer.open_exclusive(pst)
+    timer = threading.Timer(0.1, handle.Close) if release else None
+    attempts = []
+    original = pipeline.transfer.open_exclusive
+
+    def open_file(path):
+        attempts.append(path)
+        return original(path)
+
+    monkeypatch.setattr(pipeline.transfer, "open_exclusive", open_file)
+    try:
+        if timer:
+            timer.start()
+            assert ops.local_sha(pst) == expected
+            assert len(attempts) >= 2
+        else:
+            with pytest.raises(StepError) as ex:
+                ops.local_sha(pst)
+            assert ex.value.code == "PST_LOCKED" and ex.value.transient
+            assert pst.exists()
+    finally:
+        if timer:
+            timer.join()
+        else:
+            handle.Close()
+
+
+def test_live_upload_waits_after_taking_transfer_slot(env, monkeypatch):
+    r, _, _, tmp = env
+    ops = pipeline.LiveOps(r.cfg, None, tmp, tmp / "nas", [])
+    pst = tmp / "locked.pst"
+    pst.write_bytes(b"pst")
+    monkeypatch.setattr(pipeline, "wait_released", lambda *a: False)
+    monkeypatch.setattr(pipeline.transfer, "upload", lambda *a: pytest.fail("ロック中に転送してはいけない"))
+    with pytest.raises(StepError) as ex:
+        ops.upload(pst, pst.name, "sha")
+    assert ex.value.code == "PST_LOCKED"
 
 
 def test_scan_only_never_runs_live_split(env, monkeypatch):
