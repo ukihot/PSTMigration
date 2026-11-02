@@ -402,6 +402,10 @@ Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
 
 ### バージョンアップ
 
+1.2.2（2026-10-30）：`--aggregate` が、照合済みで圧縮前の束（ライブ分割）を含む status.json で異常終了し、`_admin\` に何も出ない不具合を修正。
+
+1.2.1（2026-10-22）：連絡先バックアップを一時MAPIプロファイルで作る方式へ変更。ライブ分割では Windows Search 等による出力PSTのロック解放を待ってから照合・ハッシュ計算・圧縮・転送を行い、待機上限を超えた場合も作成済みの束から再開する。
+
 `scripts/build.sh` → `dist/PSTMigration/` の中身で NETLOGON の `PSTMigration\` を上書きするだけ（`config.json` のパスワード・`cutoff`・`live_split` を入れ直すのを忘れない）。ファイルの項目が「置換」なので、次回のポリシー処理（ログオン時・約90分ごと・`gpupdate`）で各PCへ配られる。ツールが実行中のPCでは EXE が使用中で差し替えに失敗するが、次のポリシー処理で入る。処理途中のPSTは state.json の続きから再開する。
 
 ## 5. 運用
@@ -411,7 +415,7 @@ Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
 管理者PCで、先にエクスプローラーから `\\192.168.8.120\PSTBackup` を NAS のアカウントで開いておき：
 
 ```powershell
-Start-Process .\PSTMigration.exe -ArgumentList "--aggregate","\\192.168.8.120\PSTBackup" -Wait
+Start-Process "\\tsuchiyoshi.private\NETLOGON\PSTMigration\PSTMigration.exe" -ArgumentList "--aggregate","\\192.168.8.120\PSTBackup" -Wait
 ```
 
 `_admin\` に4つのCSVが出る（Excelでそのまま開ける）。

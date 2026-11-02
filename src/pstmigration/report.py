@@ -97,9 +97,11 @@ def _files(p: dict) -> list[tuple[str, dict, int | None]]:
     """収集単位の出力ファイル: (new_pst か old_7z, {name, size, sha256}, 旧メールの件数)。
 
     ライブ分割は束ごと（§16）、現行方式は1つずつ。0件の側はファイルが無い。
+    照合済み（VERIFIED）でまだ圧縮・ハッシュ前の束は size が無いので数えない。
     """
     if p.get("chunks"):
-        ordered = sorted(p["chunks"], key=lambda c: (c["bucket"] != "new", c["seq"]))
+        built = (c for c in p["chunks"] if "size" in c)
+        ordered = sorted(built, key=lambda c: (c["bucket"] != "new", c["seq"]))
         return [("new_pst" if c["bucket"] == "new" else "old_7z", c, c["range"][1] - c["range"][0]) for c in ordered]
     o, c = p.get("outputs") or {}, p.get("counts") or {}
     return [(k, o[k], c.get("old") if k == "old_7z" else None) for k in ("new_pst", "old_7z") if k in o]

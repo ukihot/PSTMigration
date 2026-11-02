@@ -113,6 +113,16 @@ def test_aggregate_lists_each_live_chunk_and_recollect_candidates(tmp_path):
     assert [(r["mailbox"], r["pst_key"], r["source_added"]) for r in recollect] == [("aoki@x.jp", "a", "2")]
 
 
+def test_aggregate_skips_chunks_not_built_yet(tmp_path):
+    # 照合後・圧縮前で止まった束（VERIFIED、size 無し）があっても集計全体が落ちない
+    e = live_unit("aoki@x.jp", "a", status="RETRY_PENDING")
+    e["checkpoint"] = None
+    e["chunks"].append({"bucket": "new", "seq": 3, "name": "n3.pst", "range": [4, 5], "status": "VERIFIED"})
+    write_status(tmp_path, "aoki@x.jp", [e])
+    ledger = rows_of(report.aggregate(tmp_path) / "ledger.csv")
+    assert (ledger[0]["new_pst_size"], ledger[0]["chunks"]) == ("150", "5")
+
+
 def test_status_and_report_carry_live_fields():
     e = live_unit("aoki@x.jp", "a", source_added={"\\受信トレイ": 1})
     assert {"split_mode", "chunks", "source_added"} <= set(report.STATUS_KEYS)
