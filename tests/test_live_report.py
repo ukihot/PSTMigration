@@ -128,3 +128,18 @@ def test_status_and_report_carry_live_fields():
     assert {"split_mode", "chunks", "source_added"} <= set(report.STATUS_KEYS)
     rep = report.build(e, "COMPLETED", {"mailbox": "aoki@x.jp"}, "aoki", "PC1", [])
     assert rep["split_mode"] == "live" and len(rep["chunks"]) == 4 and rep["source_added"] == {"\\受信トレイ": 1}
+
+
+def test_ledger_flags_duplicate_sources_without_discarding_history(tmp_path):
+    first = snapshot_unit("aoki@x.jp", "a")
+    first.update(source_path=r"C:\Mail\a.pst", source_size=0, generation=1, warnings=["SOURCE_CHANGED"])
+    second = snapshot_unit("old_owner", "a")
+    second.update(source_path=r"c:\MAIL\.\a.pst", status="PENDING", source_size=None, generation=2)
+    write_status(tmp_path, "aoki@x.jp", [first])
+    write_status(tmp_path, "old_owner", [second])
+    ledger = rows_of(report.aggregate(tmp_path) / "ledger.csv")
+    assert len(ledger) == 2 and all(r["duplicate_source"] == "True" for r in ledger)
+    assert len({r["source_status"] for r in ledger}) == 2
+    assert [(r["generation"], r["source_gb"]) for r in ledger] == [("1", "0.0"), ("2", "")]
+    assert ledger[0]["status"] == "COMPLETED" and ledger[0]["recollect_required"] == "True"
+    assert ledger[1]["recollect_required"] == "False"

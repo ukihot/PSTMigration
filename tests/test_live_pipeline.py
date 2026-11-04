@@ -224,6 +224,55 @@ def test_reset_of_failed_live_pst_starts_new_generation(env):
     assert e2["stale_remote_dirs"] == ["users\\a@x.jp\\PC1\\big_key1_1"]
 
 
+def test_live_finalization_resumes_without_mapi_and_checks_nas(env, monkeypatch):
+    r, e, src, tmp = env
+    original = r._finish
+
+    def disconnect(*args):
+        # 実際の _finish と同様にチェックポイントを先に永続化して失敗する。
+        r.st.save()
+        raise StepError("NETWORK", "report unavailable", transient=True)
+
+    monkeypatch.setattr(r, "_finish", disconnect)
+    r._process_live(e)
+    assert e["checkpoint"] == "TRANSFERRED" and e["status"] == "RETRY_PENDING"
+    assert (r.cfg.work_path / "key1").exists()
+    monkeypatch.setattr(r, "_finish", original)
+    monkeypatch.setattr(mapilive, "logon", lambda *a: pytest.fail("完了登録に MAPI は不要"))
+    scans = src.scans
+    r._process_live(e)
+    assert e["status"] == "COMPLETED" and src.scans == scans
+
+
+def test_live_transferred_missing_chunk_is_not_completed(env, monkeypatch):
+    r, e, src, tmp = env
+
+    def crash(*args):
+        r.st.save()
+        raise Crash
+
+    monkeypatch.setattr(r, "_finish", crash)
+    with pytest.raises(Crash):
+        r._process_live(e)
+    remote = r.cfg.server_path / e["remote_dir"] / e["chunks"][0]["name"]
+    remote.unlink()
+    resumed = pipeline.Runner(r.cfg, r.home)
+    e2 = resumed.st.psts[e["key"]]
+    resumed._process_live(e2)
+    assert e2["status"] == "FAILED" and e2["last_error"]["code"] == "ARTIFACT_MISMATCH"
+    assert not list(r.cfg.server_path.rglob("report.json"))
+
+
+def test_live_preflight_low_disk_stops_before_mapi_scan(env, monkeypatch):
+    r, e, src, tmp = env
+    free = type("Usage", (), {"free": 0})()
+    monkeypatch.setattr(pipeline.shutil, "disk_usage", lambda *a: free)
+    monkeypatch.setattr(mapilive, "logon", lambda *a: pytest.fail("容量不足なのに MAPI を開いた"))
+    r._process_live(e)
+    assert e["status"] == "RETRY_PENDING" and e["last_error"]["code"] == "DISK_SPACE"
+    assert src.scans == 0 and e.get("chunks", []) == []
+
+
 def test_split_mode_rule_is_used_for_decision():
     assert (
         rules.split_mode("auto", 47 * GB, 200 * GB, True, budget_bytes=10 * GB, disk_factor=2.5, reserve_bytes=5 * GB)

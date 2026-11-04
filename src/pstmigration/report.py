@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import ntpath
 from collections import Counter
 from pathlib import Path, PureWindowsPath
 
@@ -116,14 +117,22 @@ def _write_csv(path: Path, header: list[str], rows: list[list]) -> None:
 
 def aggregate(root: Path) -> Path:
     """全 status.json を集約して _admin\\ に台帳と後続作業用CSVを出す（設計書 §11.3、§11.4）。"""
-    statuses = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(root.glob("users/*/*/status.json"))]
+    statuses = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in sorted(root.glob("users/*/*/status.json"))]
+    identities = Counter(
+        (s["computer"].casefold(), ntpath.normcase(ntpath.normpath(p["source_path"])))
+        for _, s in statuses
+        for p in s["psts"]
+    )
 
-    ledger, uploaded, recollect = [], [], []
-    for s in statuses:
+    ledger, uploaded, recollect, errors = [], [], [], []
+    for source, s in statuses:
         mailbox = s.get("mailbox") or ""
+        source_status = source.relative_to(root).as_posix()
         for p in s["psts"]:
             c, err, files = p.get("counts") or {}, p.get("last_error") or {}, _files(p)
             added = sum((p.get("source_added") or {}).values())
+            recollect_required = bool(added or "SOURCE_CHANGED" in (p.get("warnings") or []))
+            duplicate = identities[(s["computer"].casefold(), ntpath.normcase(ntpath.normpath(p["source_path"])))] > 1
             ledger.append(
                 [
                     mailbox,
@@ -132,7 +141,7 @@ def aggregate(root: Path) -> Path:
                     s["computer"],
                     p["key"],
                     p["source_path"],
-                    round(p["source_size"] / 1024**3, 2) if p.get("source_size") else None,
+                    round(p["source_size"] / 1024**3, 2) if p.get("source_size") is not None else None,
                     p.get("is_default_store"),
                     p["status"],
                     p.get("checkpoint"),
@@ -151,11 +160,34 @@ def aggregate(root: Path) -> Path:
                     p.get("split_mode"),
                     len(p.get("chunks") or []),
                     added,
+                    p.get("generation"),
+                    source_status,
+                    duplicate,
+                    recollect_required,
+                    err.get("message"),
+                    err.get("phase"),
+                    err.get("checkpoint"),
+                    err.get("exception_type"),
+                    err.get("retryable"),
+                    err.get("tool_version"),
                 ]
             )
+            if err:
+                errors.append(
+                    {
+                        "mailbox": mailbox,
+                        "computer": s["computer"],
+                        "pst_key": p["key"],
+                        "source_status": source_status,
+                        "generation": p.get("generation"),
+                        "status": p["status"],
+                        "checkpoint": p.get("checkpoint"),
+                        "error": err,
+                    }
+                )
             if p.get("checkpoint") == "TRANSFERRED":
                 uploaded.append((mailbox or s["user"], s["computer"], p))
-            if added or "SOURCE_CHANGED" in (p.get("warnings") or []):
+            if recollect_required:
                 warnings = "|".join(p.get("warnings") or [])
                 recollect.append([mailbox, s["computer"], p["key"], p["source_path"], p["status"], added, warnings])
 
@@ -226,9 +258,20 @@ def aggregate(root: Path) -> Path:
             "split_mode",
             "chunks",
             "source_added",
+            "generation",
+            "source_status",
+            "duplicate_source",
+            "recollect_required",
+            "last_error_message",
+            "last_error_phase",
+            "last_error_checkpoint",
+            "last_error_exception_type",
+            "last_error_retryable",
+            "last_error_tool_version",
         ],
         ledger,
     )
+    write_json(out / "errors.json", errors)
     _write_csv(
         out / "recollect_candidates.csv",  # 調査後に増えたメールがある収集単位（移行直前の再回収の候補。§16.7）
         ["mailbox", "computer", "pst_key", "source_path", "status", "source_added", "warnings"],

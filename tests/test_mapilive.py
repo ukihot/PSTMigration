@@ -94,6 +94,32 @@ def test_digest_is_unambiguous_about_part_boundaries():
     assert mapilive.digest([b"ab", b"c"]) == mapilive.digest([b"ab", b"c"])
 
 
+@pytest.mark.parametrize("name", ["⑴相談", "㈶テスト", "⓪連絡", "補助文字📨"])
+def test_create_folder_uses_unicode_without_ansi_conversion(name):
+    from win32comext.mapi import mapi
+
+    calls = []
+
+    class Folder:
+        def CreateFolder(self, kind, folder_name, comment, iid, flags):
+            assert flags & mapi.MAPI_UNICODE
+            calls.append(folder_name)
+            return self
+
+        def SetProps(self, props):
+            pass
+
+        def SaveChanges(self, flags):
+            pass
+
+    store = object.__new__(mapilive.MapiStore)
+    store._folders = {}
+    store._root_eid = b"root"
+    store.open = lambda eid: Folder()
+    store.ensure_folder("\\" + name, "IPF.Note")
+    assert calls == [name]
+
+
 # ---- 連絡先バックアップのコピー計画（どのフォルダーを、どこへ） --------------------------------
 
 

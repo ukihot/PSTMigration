@@ -96,7 +96,7 @@ Get-Content $env:LOCALAPPDATA\PSTMigration\state.json -Encoding utf8 | Select-St
 |---|---|
 | `split_mode` が `snapshot` / `live` | ふつうの方式 / ライブ分割 |
 | `snapshot_at` が `null`（ふつうの方式） | ②のコピーがまだ |
-| `status` が `SCANNING` `SPLITTING` `VERIFYING` `COMPRESSING` `TRANSFERRING` | 処理中 |
+| `status` が `SCANNING` `SPLITTING` `VERIFYING` `COMPRESSING` `TRANSFERRING` `FINALIZING` | 処理中（`FINALIZING` は完了レポート保存中） |
 | `chunks` の各 `status`（ライブ分割） | `VERIFIED`（照合済み）→ `BUILT`（転送待ち）→ `UPLOADED`（NAS に届いた） |
 | `status` が `COMPLETED` | 完了 |
 
@@ -402,6 +402,14 @@ Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
 
 ### バージョンアップ
 
+1.2.3（2026-11-04）：障害解析と検証済み成果物からの再開を改善。`UNEXPECTED` は即 `FAILED` にして、例外クラス・内部例外付きスタックトレース・発生工程・発生時バージョンを `last_error` に保存する。`--aggregate` で詳細を `_admin/errors.json` に集約する。`ARCHIVED` の再開時はサイズとSHA-256を確認し、不正な成果物は消さずに停止する。`TRANSFERRED` からの完了登録再開もNASを照合する。ライブ分割は調査前にも最低限の空き容量を確認する。詳細と復旧手順は設計書 §17。
+
+`ledger.csv` の末尾に、世代・出典 `status.json`・同一PC/同一PSTパスの重複候補・再収集要否・例外情報を追加。重複行は履歴か別対象かを判断できないため削除しない。`source_gb` は実サイズ0と未取得（空欄）を区別する。
+
+NAS上の詳細も確認したところ、CSVの39件に対し、現在も残る `ARCHIVED / UNEXPECTED` 37件は同じSMBゲストアクセス拒否だった。代表端末のログで、v1.2.1の `transfer.slot` 内のNAS一覧取得時にWinError 1272が出たことを確認。この経路を `NETWORK / RETRY_PENDING` に修正したが、NASの認証設定自体は別途確認が必要。ライブ分割4件の文字コード例外については、フォルダー作成のUnicode指定とJSON保存も修正した。
+
+v1.2.2以前のCSVの `tool_version` は状態を最後に出力したツールの版であり、例外が発生した版を証明しない。既存の `FAILED` は自動で解除しない。
+
 1.2.2（2026-10-30）：`--aggregate` が、照合済みで圧縮前の束（ライブ分割）を含む status.json で異常終了し、`_admin\` に何も出ない不具合を修正。
 
 1.2.1（2026-10-22）：連絡先バックアップを一時MAPIプロファイルで作る方式へ変更。ライブ分割では Windows Search 等による出力PSTのロック解放を待ってから照合・ハッシュ計算・圧縮・転送を行い、待機上限を超えた場合も作成済みの束から再開する。
@@ -468,10 +476,11 @@ Start-Process "\\tsuchiyoshi.private\NETLOGON\PSTMigration\PSTMigration.exe" -Ar
 | `ARCHIVE_FAILED` / `ARCHIVE_TEST_FAILED` | 7z 圧縮・テストの失敗 | ログの7z出力を確認。AppLocker で `%TEMP%` 実行禁止なら設計書 §10.1 |
 | `SLOT_BUSY` | 転送枠が空かない | スロットを増やすか放置 |
 | `NETWORK` / `ACCESS_DENIED` | NAS に書けない | NAS の電源・VPN接続、`server_user` / `server_password`、NAS 側の読み書き権限、[繋がらないとき](#繋がらないとき) |
-| `HASH_MISMATCH` | 転送後のハッシュ不一致 | 自動で再転送。続くならネットワーク／サーバのディスクを疑う |
+| `HASH_MISMATCH` | NAS転送後のファイル全体のSHA-256不一致 | `last_error.details` で期待値・NAS側・現在のローカル側のハッシュを比較。ローカルも記録と違う場合は即 FAILED、ローカルが一致する場合は再試行（上限あり）。メール単位の照合失敗とは別 |
+| `ARTIFACT_MISSING` / `ARTIFACT_MISMATCH` / `ARTIFACT_METADATA` | 再開に必要な成果物が無い・内容が変わった・検証記録が不整合 | 即 FAILED。作業ファイルを保持して調査する。`ARCHIVED` は検証情報を復元できるまで再開不可 |
 | `REMOTE_CONFLICT` | サーバに同名で中身の違うファイルがある（ふつうの方式） | 上書きはしない。どちらが正しいか確認して手で整理 |
 | `UNMIGRATED_ITEMS` | 日付の取れないメールがある（転送自体は済んでいる） | report.json の `errors` で場所を確認。元PSTに残っているので個別対応 |
-| `UNEXPECTED` | 想定外の例外 | ローカルログのスタックトレースを確認 |
+| `UNEXPECTED` | 想定外の例外 | 即 FAILED。`_admin/errors.json` またはローカルログのスタックトレースを確認し、原因解消後に個別に `--reset` |
 
 | 警告（warnings） | 意味 |
 |---|---|
@@ -479,7 +488,7 @@ Start-Process "\\tsuchiyoshi.private\NETLOGON\PSTMigration\PSTMigration.exe" -Ar
 | `SOURCE_CHANGED` | ふつうの方式：完了後に元PSTのメールが増減した。ライブ分割：調査後にメールが増えた。どちらも `recollect_candidates.csv` に出る（下の再収集を参照） |
 | `STALE_REMOTE_LEFT` | `cutoff` 変更・`--reset` 前の NAS フォルダーを消せなかった。`stale_remote_dirs` のフォルダーを手で削除 |
 | `NEW_PST_OVER_LIMIT` | 新メールPSTが20GB超（ふつうの方式）。Purview 投入前に手で分割を検討 |
-| `ARTIFACT_MISSING` / `SNAPSHOT_MISSING` | 作業ファイルが消えていたので最初からやり直した |
+| `ARTIFACT_MISSING` / `SNAPSHOT_MISSING` | 分割までの作業ファイルが消えていたので最初からやり直した。`ARCHIVED` 以降の成果物欠落は上記エラーとして停止する |
 
 ### FAILED を再試行させる
 

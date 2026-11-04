@@ -59,7 +59,10 @@ def open_exclusive(path: Path):
 @contextmanager
 def slot(server_root: Path, wait_min: float) -> Iterator[None]:
     """_slots\\slot*.lock のどれかを排他オープンして保持する。_slots が無ければ制限なし。"""
-    slots = sorted((server_root / "_slots").glob("slot*.lock"))
+    try:
+        slots = sorted((server_root / "_slots").glob("slot*.lock"))
+    except OSError as ex:
+        raise StepError("NETWORK", str(ex), transient=True) from ex
     if not slots:
         yield
         return
@@ -68,8 +71,11 @@ def slot(server_root: Path, wait_min: float) -> Iterator[None]:
         for s in slots:
             try:
                 handle = open_exclusive(s)
-            except pywintypes.error:
-                continue
+            except pywintypes.error as ex:
+                if ex.winerror in (32, 33):  # 共有違反・ロック違反だけを「枠が使用中」と扱う
+                    continue
+                code = "ACCESS_DENIED" if ex.winerror == 5 else "NETWORK"
+                raise StepError(code, str(ex), transient=True) from ex
             log.info("転送枠を取得: %s", s.name)
             try:
                 yield
@@ -117,9 +123,24 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: boo
                     if ahead > 0:
                         time.sleep(ahead)
 
-        if sha256_file(part) != sha256:
+        remote_sha = sha256_file(part)
+        if remote_sha != sha256:
+            local_sha = sha256_file(src)
             part.unlink()
-            raise StepError("HASH_MISMATCH", f"転送後のSHA-256が一致しません: {dst}")
+            raise StepError(
+                "HASH_MISMATCH",
+                f"転送後のSHA-256が一致しません: {dst}",
+                final=local_sha != sha256,
+                details={
+                    "stage": "transfer_verify",
+                    "source": str(src),
+                    "destination": str(dst),
+                    "expected_sha256": sha256,
+                    "remote_sha256": remote_sha,
+                    "local_sha256": local_sha,
+                    "local_matches_expected": local_sha == sha256,
+                },
+            )
         if overwrite:
             os.replace(part, dst)
         else:

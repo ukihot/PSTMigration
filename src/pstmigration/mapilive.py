@@ -355,7 +355,7 @@ class MapiStore:
                 if sofar in self._folders:
                     f = self._folders[sofar]
                     continue
-                f = f.CreateFolder(FOLDER_GENERIC, name, None, None, OPEN_IF_EXISTS)
+                f = f.CreateFolder(FOLDER_GENERIC, name, None, None, OPEN_IF_EXISTS | _mapi().MAPI_UNICODE)
                 if sofar == path and container_class:
                     f.SetProps([(PR_CONTAINER_CLASS_W, container_class)])
                     f.SaveChanges(0)

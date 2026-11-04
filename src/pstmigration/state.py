@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,12 +25,15 @@ class StepError(Exception):
     どちらでもない: 試行回数を数え、max_attempts で FAILED。
     """
 
-    def __init__(self, code: str, message: str = "", *, transient: bool = False, final: bool = False):
+    def __init__(
+        self, code: str, message: str = "", *, transient: bool = False, final: bool = False, details: dict | None = None
+    ):
         super().__init__(f"{code}: {message}")
         self.code = code
         self.message = message
         self.transient = transient
         self.final = final
+        self.details = details
 
 
 def now_iso() -> str:
@@ -47,7 +51,8 @@ def write_json(path: Path, data: Any) -> None:
     """一時ファイル→置換で原子的に書く。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # MAPI が孤立サロゲートを返しても文字を捨てず、JSON の \uXXXX として保存する。
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8", errors="backslashreplace")
     os.replace(tmp, path)
 
 
@@ -74,8 +79,27 @@ def new_entry(key: str, path: str, is_default: bool) -> dict:
     }
 
 
-def apply_error(entry: dict, err: StepError, max_attempts: int) -> None:
-    entry["last_error"] = {"code": err.code, "message": err.message[:500], "at": now_iso()}
+def apply_error(entry: dict, err: StepError, max_attempts: int, *, cause: Exception | None = None) -> None:
+    failure = {
+        "code": err.code,
+        "message": err.message[:500],
+        "at": now_iso(),
+        "phase": entry["status"],
+        "checkpoint": entry.get("checkpoint"),
+        "pst_key": entry["key"],
+        "tool_version": __version__,
+        "generation": entry.get("generation", 1),
+    }
+    if err.details:
+        failure["details"] = err.details
+    if cause is not None:
+        failure.update(
+            exception_type=f"{type(cause).__module__}.{type(cause).__qualname__}",
+            exception_message=str(cause)[:2000],
+            # 内部例外も含む。メール本文・添付やフレームのローカル変数は収集しない。
+            traceback="".join(traceback.format_exception(cause))[-16000:],
+        )
+    entry["last_error"] = failure
     if err.final:
         entry["status"] = "FAILED"
     elif err.transient:
@@ -83,6 +107,7 @@ def apply_error(entry: dict, err: StepError, max_attempts: int) -> None:
     else:
         entry["attempts"] = entry.get("attempts", 0) + 1
         entry["status"] = "FAILED" if entry["attempts"] >= max_attempts else "RETRY_PENDING"
+    failure["retryable"] = entry["status"] == "RETRY_PENDING"
     log.warning("PST %s: %s -> %s", entry["key"], err, entry["status"])
 
 

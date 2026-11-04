@@ -108,7 +108,7 @@ def _new_live_generation(entry: dict) -> None:
     """ライブ分割を新しい世代でやり直す。前世代の NAS 上の束は、新世代の転送が済んでから消す（_purge_stale）。"""
     if entry.get("remote_dir"):
         entry.setdefault("stale_remote_dirs", []).append(entry["remote_dir"])
-    entry.update(remote_dir=None, chunks=[], generation=entry.get("generation", 1) + 1)
+    entry.update(remote_dir=None, chunks=[], checkpoint=None, generation=entry.get("generation", 1) + 1)
 
 
 def wait_released(path: Path, seconds: float) -> bool:
@@ -206,9 +206,9 @@ def run_snapshot(cfg: Config, home: Path) -> None:
         except FileNotFoundError:
             apply_error(e, StepError("SOURCE_MISSING", str(src), transient=True), cfg.max_attempts)
         except StepError as err:
-            apply_error(e, err, cfg.max_attempts)
+            apply_error(e, err, cfg.max_attempts, cause=err)
         except OSError as ex:
-            apply_error(e, StepError("SNAPSHOT_IO", str(ex), transient=True), cfg.max_attempts)
+            apply_error(e, StepError("SNAPSHOT_IO", str(ex), transient=True), cfg.max_attempts, cause=ex)
         finally:
             st.save()  # continue でも警告を残す
 
@@ -531,10 +531,14 @@ class Runner:
         try:
             self._live(e)
         except Exception as ex:  # 想定外でも他のPSTの処理は続ける
-            apply_error(e, self._classify(e, ex), self.cfg.max_attempts)
+            apply_error(e, self._classify(e, ex), self.cfg.max_attempts, cause=ex)
 
     def _live(self, e: dict) -> None:
         work = self.cfg.work_path / e["key"]
+        if e.get("checkpoint") == "TRANSFERRED":
+            self._verify_transferred(e)
+            self._finish(e, work)
+            return
         plan = read_json(work / PLAN, None)
         if plan is not None and plan.get("generation") != e.get("generation", 1):
             plan = None  # --reset・cutoff 変更で世代が変わった
@@ -543,6 +547,20 @@ class Runner:
                 _new_live_generation(e)
             shutil.rmtree(work, ignore_errors=True)
         work.mkdir(parents=True, exist_ok=True)
+        if plan is None:
+            limits = self._limits()
+            free = shutil.disk_usage(work).free
+            if (
+                chunks.chunk_target(
+                    free,
+                    max_bytes=limits["max"],
+                    min_bytes=limits["min"],
+                    reserve_bytes=limits["reserve"],
+                    factor=limits["factor"],
+                )
+                is None
+            ):
+                raise StepError("DISK_SPACE", f"空き {free / GB:.1f}GB ではライブ分割を開始できない", transient=True)
         if not e.get("remote_dir"):
             stamp = datetime.now().strftime("%Y%m%d%H%M%S")
             stem = Path(e["source_path"]).stem
@@ -691,21 +709,22 @@ class Runner:
             if e["checkpoint"] == "TRANSFERRED":
                 self._finish(e, work)
         except Exception as ex:  # 想定外でも他のPSTの処理は続ける
-            apply_error(e, self._classify(e, ex), self.cfg.max_attempts)
+            apply_error(e, self._classify(e, ex), self.cfg.max_attempts, cause=ex)
 
     def _classify(self, e: dict, ex: Exception) -> StepError:
+        if isinstance(ex, StepError):
+            self._ol_died()
+            return ex  # 検証失敗等の確定した原因を Outlook の状態で上書きしない
         if self._ol_died():
             # 処理中に Outlook が終了・クラッシュした。PST側の問題ではないので回数に数えない
             return StepError("OUTLOOK_LOST", repr(ex), transient=True)
-        if isinstance(ex, StepError):
-            return ex
         if isinstance(ex, PermissionError):
             # 切り離し直後の Outlook やウイルス対策ソフトがファイルを掴んでいる（共有違反）
             return StepError("PST_LOCKED", repr(ex), transient=True)
         if isinstance(ex, pywintypes.com_error):
             return StepError("OUTLOOK_COM", str(ex), transient=True)
         log.exception("PST %s: 想定外のエラー", e["key"])
-        return StepError("UNEXPECTED", repr(ex))
+        return StepError("UNEXPECTED", repr(ex), final=True)
 
     def _artifacts_ok(self, e: dict, work: Path) -> bool:
         """出力ファイルが欠けていたら完了扱いにしない（FR-08）。"""
@@ -713,11 +732,75 @@ class Runner:
         if cp == "SPLIT":
             return (work / self.names.old_pst).exists() and (work / self.names.new_pst).exists()
         if cp == "ARCHIVED":
-            return all(
-                (work / o["name"]).exists() and (work / o["name"]).stat().st_size == o["size"]
-                for o in e["outputs"].values()
-            )
+            self._verify_archived(e, work)
+        if cp == "TRANSFERRED":
+            self._verify_transferred(e)
         return True
+
+    def _snapshot_outputs(self, e: dict) -> list[dict]:
+        outputs = e.get("outputs") or {}
+        counts = e.get("counts") or {}
+        required = {k for k, b in (("new_pst", "new"), ("old_7z", "old")) if counts.get(b, 0)}
+        if not {"new", "old"} <= counts.keys() or set(outputs) != required or not e.get("remote_dir"):
+            raise StepError("ARTIFACT_METADATA", "件数・成果物一覧・転送先が不整合です", final=True)
+        for o in outputs.values():
+            if not o.get("sha256") or not o.get("name") or o.get("size") is None:
+                raise StepError("ARTIFACT_METADATA", "成果物の検証情報が不足しています", final=True)
+        return list(outputs.values())
+
+    def _verify_archived(self, e: dict, work: Path) -> None:
+        """検証済みの成果物だけ再利用する。不正・欠落時も作業フォルダーは保持する。"""
+        e["status"] = "VERIFYING"
+        self.st.save()
+        for o in self._snapshot_outputs(e):
+            local = work / o["name"]
+            if local.exists():
+                if not wait_released(local, self.cfg.release_wait_sec):
+                    raise StepError("PST_LOCKED", f"ファイルを解放しません: {local.name}", transient=True)
+                if local.stat().st_size != o["size"] or transfer.sha256_file(local) != o["sha256"]:
+                    raise StepError("ARTIFACT_MISMATCH", f"ローカル成果物が検証記録と違います: {local}", final=True)
+                continue
+            # 正式名への転送後、チェックポイント保存前に落ちた場合は NAS の検証済みコピーを再利用。
+            remote = self.cfg.server_path / e["remote_dir"] / o["name"]
+            try:
+                valid = (
+                    remote.exists()
+                    and remote.stat().st_size == o["size"]
+                    and transfer.sha256_file(remote) == o["sha256"]
+                )
+            except OSError as ex:
+                raise StepError("NETWORK", str(ex), transient=True) from ex
+            if not valid:
+                raise StepError("ARTIFACT_MISSING", f"検証可能な成果物がありません: {local}", final=True)
+
+    def _verify_transferred(self, e: dict) -> None:
+        """完了登録の再開前に、NAS の正式名ファイルを記録と照合する。"""
+        e["status"] = "VERIFYING"
+        self.st.save()
+        if e.get("split_mode") == "live":
+            outputs = e.get("chunks") or []
+            counts = e.get("counts") or {}
+            if not {"new", "old"} <= counts.keys() or not e.get("remote_dir"):
+                raise StepError("ARTIFACT_METADATA", "件数・転送先が不明です", final=True)
+            problems = chunks.completion_problems(outputs, counts)
+            if problems:
+                raise StepError("CHUNKS_INCOMPLETE", " / ".join(problems[:5]), final=True)
+        else:
+            outputs = self._snapshot_outputs(e)
+        for o in outputs:
+            if not o.get("sha256") or not o.get("name") or o.get("size") is None:
+                raise StepError("ARTIFACT_METADATA", "成果物の検証情報が不足しています", final=True)
+            remote = self.cfg.server_path / e["remote_dir"] / o["name"]
+            try:
+                valid = (
+                    remote.exists()
+                    and remote.stat().st_size == o["size"]
+                    and transfer.sha256_file(remote) == o["sha256"]
+                )
+            except OSError as ex:
+                raise StepError("NETWORK", str(ex), transient=True) from ex
+            if not valid:
+                raise StepError("ARTIFACT_MISMATCH", f"NAS 成果物が検証記録と違います: {remote}", final=True)
 
     def _split(self, e: dict, work: Path) -> bool:
         """スナップショットの調査・分割・検証（設計書 §5）。"""
@@ -876,6 +959,8 @@ class Runner:
         _add_duration(e, "transfer", t0)
 
     def _finish(self, e: dict, work: Path) -> None:
+        e["status"] = "FINALIZING"
+        self.st.save()  # ライブ分割でも TRANSFERRED を完了レポート出力前に確定する
         unmigrated = e["counts"].get("unmigrated", 0)
         status = "COMPLETED" if unmigrated == 0 else "FAILED"
         if unmigrated:
@@ -886,7 +971,8 @@ class Runner:
                 "retryable": False,
             }
         folders = (read_json(work / SCAN, None) or {}).get("folders", [])
-        rep = report.build(e, status, self.st.data, _user(), _computer(), folders)
+        report_entry = e if unmigrated else e | {"last_error": None}
+        rep = report.build(report_entry, status, self.st.data, _user(), _computer(), folders)
         write_json(self.home / "reports" / f"{e['key']}.json", rep)
         try:
             write_json(self.cfg.server_path / e["remote_dir"] / "report.json", rep)

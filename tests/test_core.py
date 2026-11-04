@@ -12,6 +12,17 @@ JST = timezone(timedelta(hours=9))
 CUTOFF = config.Config().cutoff_utc
 
 
+def test_write_json_preserves_unpaired_mapi_surrogates(tmp_path):
+    from pstmigration.state import read_json
+
+    path = tmp_path / "plan.json"
+    data = {"subject": "日本語\ud800件名\udfff", "folder": "受信トレイ📨", "literal": r"\ud800"}
+    write_json(path, data)
+    assert read_json(path, None) == data
+    assert "日本語" in path.read_text(encoding="utf-8")
+    assert "\\ud800" in path.read_text(encoding="utf-8")
+
+
 def utc(*a, tz=JST):
     return datetime(*a, tzinfo=tz).astimezone(UTC)
 
@@ -195,12 +206,75 @@ def test_upload_hash_mismatch_discards_partial(tmp_path):
     with pytest.raises(StepError) as ex:
         transfer.upload(src, dst, "0" * 64, max_mbps=0)
     assert ex.value.code == "HASH_MISMATCH"
+    assert ex.value.final and ex.value.details["local_matches_expected"] is False
+    assert ex.value.details["stage"] == "transfer_verify"
     assert not dst.exists() and not (tmp_path / "r" / "a.pst.partial").exists()
+
+
+def test_upload_corrupt_partial_distinguishes_transport_from_local_change(tmp_path):
+    src, dst = tmp_path / "source.pst", tmp_path / "nas" / "out.pst"
+    src.write_bytes(b"abcdefgh")
+    dst.parent.mkdir()
+    part = dst.with_name(dst.name + ".partial")
+    part.write_bytes(b"bad")
+    expected = transfer.sha256_file(src)
+    with pytest.raises(StepError) as ex:
+        transfer.upload(src, dst, expected, 0)
+    err = ex.value
+    assert err.code == "HASH_MISMATCH" and not err.final
+    assert err.details["local_matches_expected"] is True
+    assert err.details["expected_sha256"] == err.details["local_sha256"] == expected
+    assert err.details["remote_sha256"] != expected
+    assert src.read_bytes() == b"abcdefgh" and not dst.exists() and not part.exists()
+    transfer.upload(src, dst, expected, 0)
+    assert dst.read_bytes() == src.read_bytes()
 
 
 def test_slot_without_slots_dir_is_unlimited(tmp_path):
     with transfer.slot(tmp_path, wait_min=0):
         pass
+
+
+def test_slot_locks_are_released_after_failure(tmp_path):
+    slots = tmp_path / "_slots"
+    slots.mkdir()
+    (slots / "slot1.lock").touch()
+    with pytest.raises(RuntimeError), transfer.slot(tmp_path, wait_min=0):
+        with pytest.raises(StepError) as ex, transfer.slot(tmp_path, wait_min=-1):
+            pytest.fail("使用中の枠を取得できてしまった")
+        assert ex.value.code == "SLOT_BUSY"
+        raise RuntimeError("upload failed")
+    with transfer.slot(tmp_path, wait_min=0):
+        pass
+
+
+def test_slot_network_failure_is_not_reported_as_busy(tmp_path, monkeypatch):
+    import pywintypes
+
+    slots = tmp_path / "_slots"
+    slots.mkdir()
+    (slots / "slot1.lock").touch()
+
+    def disconnected(path):
+        raise pywintypes.error(53, "CreateFile", "Network path was not found")
+
+    monkeypatch.setattr(transfer, "open_exclusive", disconnected)
+    with pytest.raises(StepError) as ex, transfer.slot(tmp_path, wait_min=0):
+        pytest.fail("切断中に転送を始めた")
+    assert ex.value.code == "NETWORK" and ex.value.transient
+
+
+def test_slot_guest_policy_failure_during_directory_listing_is_retryable(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    def blocked(path, pattern):
+        raise OSError(22, "guest access blocked", str(path), 1272)
+
+    monkeypatch.setattr(Path, "glob", blocked)
+    with pytest.raises(StepError) as ex, transfer.slot(tmp_path, wait_min=0):
+        pytest.fail("NAS一覧取得失敗後に転送を始めた")
+    assert ex.value.code == "NETWORK" and ex.value.transient
+    assert ex.value.__cause__.winerror == 1272
 
 
 # ---- 集計 ------------------------------------------------------------------------

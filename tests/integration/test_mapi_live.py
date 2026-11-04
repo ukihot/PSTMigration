@@ -70,6 +70,20 @@ def mapi_env(tmp_path):
         assert mapilive.profile_names() == before, "一時プロファイルが残っている"
 
 
+def test_unicode_folder_names_roundtrip_in_isolated_pst(mapi_env):
+    tp = mapilive.TempProfile(mapi_env / "unicode_folders.pst", create=True)
+    names = {"\\⑴相談", "\\㈶テスト", "\\⓪連絡", "\\補助文字📨"}
+    try:
+        store = tp.open_store(writable=True)
+        for path in names:
+            folder = store.ensure_folder(path, "IPF.Note")
+            del folder
+        assert names <= {path for path, _, _, _ in store.walk()}
+        del store
+    finally:
+        tp.close()
+
+
 @pytest.fixture
 def source(mapi_env):
     """テスト用の元PST。受信（旧・新・日付不明・非メール・大きいヘッダー）、送信、空のサブフォルダー、予定表。"""
