@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import json
 import logging
 import msvcrt
 import os
@@ -18,7 +19,7 @@ import pywintypes
 import win32con
 import win32file
 
-from pstmigration import chunks, mapilive, report, rules, transfer
+from pstmigration import chunks, mapilive, report, rules, transfer, winenv
 from pstmigration.config import Config
 from pstmigration.state import (
     TERMINAL,
@@ -109,6 +110,14 @@ def _new_live_generation(entry: dict) -> None:
     if entry.get("remote_dir"):
         entry.setdefault("stale_remote_dirs", []).append(entry["remote_dir"])
     entry.update(remote_dir=None, chunks=[], checkpoint=None, generation=entry.get("generation", 1) + 1)
+
+
+def locked_error(path: Path, msg: str) -> StepError:
+    """PST_LOCKED。どのプロセスが掴んでいるか（Restart Manager）も載せる（設計書 §18.5）。"""
+    who = winenv.holders(path)
+    if who:
+        log.warning("使用中のプロセス %s: %s", path, ", ".join(who))
+    return StepError("PST_LOCKED", f"{msg}: {path}" + (f"（使用中: {', '.join(who)}）" if who else ""), transient=True)
 
 
 def wait_released(path: Path, seconds: float) -> bool:
@@ -269,7 +278,7 @@ class LiveOps:
 
     def _wait_local(self, path: Path, seconds: float | None = None) -> None:
         if not wait_released(path, self.cfg.release_wait_sec if seconds is None else seconds):
-            raise StepError("PST_LOCKED", f"他のプロセスがファイルを解放しません: {path}", transient=True)
+            raise locked_error(path, "他のプロセスがファイルを解放しません")
 
     def local_sha(self, path: Path) -> str:
         """照合で開き直したPSTも解放を待つ。確認直後の再ロックは同じ待機期限内で再試行。"""
@@ -280,7 +289,7 @@ class LiveOps:
                 return transfer.sha256_file(path)
             except PermissionError as ex:
                 if time.monotonic() >= deadline:
-                    raise StepError("PST_LOCKED", f"ファイルを読み取れません: {path}: {ex}", transient=True) from ex
+                    raise locked_error(path, f"ファイルを読み取れません（{ex}）") from ex
                 log.info("SHA-256 計算時に再ロックされたため再試行: %s", path)
                 time.sleep(min(0.2, max(0, deadline - time.monotonic())))
 
@@ -354,7 +363,8 @@ class Runner:
         return self.ol_lost
 
     def run(self) -> None:
-        transfer.connect(self.cfg.server_root, self.cfg.server_user, self.cfg.server_password)
+        connected = transfer.connect(self.cfg.server_root, self.cfg.server_user, self.cfg.server_password)
+        self.st.data["env"] = winenv.snapshot(self.cfg.work_path) | {"nas_connected": connected}
         ready = False
         try:
             self._outlook().cleanup(self.cfg.work_path)
@@ -377,13 +387,16 @@ class Runner:
         self.st.save()
 
         if ready:
+            if apply_resets(self.st.psts, self.cfg.server_path / "_admin" / "reset.json", _computer()):
+                self.st.save()
+            purge_orphan_work(self.cfg.work_path, self.st.psts)
             for e in list(self.st.psts.values()):
                 if self.ol_lost:
                     break
                 self._process_entry(e)
                 self.st.save()
 
-        report.publish_status(self.cfg.server_path, self.st.data, _user(), _computer())
+        report.publish_status(self.cfg.server_path, self.st.data, _user(), _computer(), self.home / "logs")
 
     # ---- 検出 ------------------------------------------------------------
 
@@ -482,7 +495,8 @@ class Runner:
                     mapilive.logon(self.profile).Logoff(0, 0, 0)
                 self._mapi_checked = True
             except Exception as ex:
-                log.warning("MAPI のセッションを張れないため、ライブ分割を使えません: %r", ex)
+                log.warning("MAPI のセッションを張れないため、ライブ分割を使えません: %r", ex, exc_info=True)
+                self.st.data.setdefault("env", {})["mapi_error"] = repr(ex)[:500]
                 self._mapi_checked = False
         return self._mapi_checked
 
@@ -505,7 +519,14 @@ class Runner:
         )
         if mode == "wait":
             e["split_mode"] = None
-            why = "live_split=off" if c.live_split == "off" else "MAPI のセッションを張れない"
+            env = self.st.data.get("env") or {}
+            why = (
+                "live_split=off"
+                if c.live_split == "off"
+                else f"MAPI のセッションを張れない（Outlook {env.get('outlook_bitness')}"
+                f" / ツール {winenv.TOOL_BITS}bit: "
+                f"{env.get('mapi_error')}）"
+            )
             apply_error(
                 e,
                 StepError("LIVE_SPLIT_UNAVAILABLE", f"現行方式では処理できず、{why}", transient=True),
@@ -658,14 +679,14 @@ class Runner:
         try:
             # 前回の残りは cleanup() で切り離し済み。Outlook が手放すのを待って作り直す
             if not wait_released(pst, self.cfg.release_wait_sec):
-                raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
+                raise locked_error(pst, "Outlook がファイルを解放しません")
             shutil.rmtree(work, ignore_errors=True)
             work.mkdir(parents=True, exist_ok=True)
             sources = self._outlook().contact_sources(self.cfg.work_path)
             count = mapilive.export_contacts(pst, self.profile, sources)
             if count:
                 if not wait_released(pst, self.cfg.release_wait_sec):
-                    raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {pst.name}", transient=True)
+                    raise locked_error(pst, "Outlook がファイルを解放しません")
                 remote = PureWindowsPath("users", _owner(self.st.data), _computer(), pst.name)
                 transfer.upload(
                     pst,
@@ -720,6 +741,8 @@ class Runner:
             return StepError("OUTLOOK_LOST", repr(ex), transient=True)
         if isinstance(ex, PermissionError):
             # 切り離し直後の Outlook やウイルス対策ソフトがファイルを掴んでいる（共有違反）
+            if ex.filename:
+                return locked_error(Path(ex.filename), repr(ex))
             return StepError("PST_LOCKED", repr(ex), transient=True)
         if isinstance(ex, pywintypes.com_error):
             return StepError("OUTLOOK_COM", str(ex), transient=True)
@@ -737,11 +760,22 @@ class Runner:
             self._verify_transferred(e)
         return True
 
+    def _artifact_counts(self, e: dict) -> dict[str, int]:
+        """再開用の件数。JSON の真偽値や小数を整数として受け入れない。"""
+        counts = e.get("counts")
+        if (
+            not isinstance(counts, dict)
+            or not {"new", "old"} <= counts.keys()
+            or any(type(n) is not int or n < 0 for n in counts.values())
+        ):
+            raise StepError("ARTIFACT_METADATA", "件数には old・new と非負の整数が必要です", final=True)
+        return counts
+
     def _snapshot_outputs(self, e: dict) -> list[dict]:
         outputs = e.get("outputs") or {}
-        counts = e.get("counts") or {}
+        counts = self._artifact_counts(e)
         required = {k for k, b in (("new_pst", "new"), ("old_7z", "old")) if counts.get(b, 0)}
-        if not {"new", "old"} <= counts.keys() or set(outputs) != required or not e.get("remote_dir"):
+        if set(outputs) != required or not e.get("remote_dir"):
             raise StepError("ARTIFACT_METADATA", "件数・成果物一覧・転送先が不整合です", final=True)
         for o in outputs.values():
             if not o.get("sha256") or not o.get("name") or o.get("size") is None:
@@ -756,7 +790,7 @@ class Runner:
             local = work / o["name"]
             if local.exists():
                 if not wait_released(local, self.cfg.release_wait_sec):
-                    raise StepError("PST_LOCKED", f"ファイルを解放しません: {local.name}", transient=True)
+                    raise locked_error(local, "ファイルを解放しません")
                 if local.stat().st_size != o["size"] or transfer.sha256_file(local) != o["sha256"]:
                     raise StepError("ARTIFACT_MISMATCH", f"ローカル成果物が検証記録と違います: {local}", final=True)
                 continue
@@ -779,8 +813,8 @@ class Runner:
         self.st.save()
         if e.get("split_mode") == "live":
             outputs = e.get("chunks") or []
-            counts = e.get("counts") or {}
-            if not {"new", "old"} <= counts.keys() or not e.get("remote_dir"):
+            counts = self._artifact_counts(e)
+            if not e.get("remote_dir"):
                 raise StepError("ARTIFACT_METADATA", "件数・転送先が不明です", final=True)
             problems = chunks.completion_problems(outputs, counts)
             if problems:
@@ -810,7 +844,7 @@ class Runner:
             return False
         # 前回の異常終了で残った接続を cleanup() で外した直後は、まだ Outlook が掴んでいる
         if not wait_released(snap, self.cfg.release_wait_sec):
-            raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {snap.name}", transient=True)
+            raise locked_error(snap, "Outlook がファイルを解放しません")
         kind, fmt = rules.pst_header(snap)
         if kind != "PST":
             raise StepError("NOT_PST", f"ヘッダー判定={kind}", final=True)
@@ -883,7 +917,7 @@ class Runner:
         old_pst, new_pst, archive = (work / n for n in (self.names.old_pst, self.names.new_pst, self.names.old_7z))
         for p in (old_pst, new_pst, work / SNAPSHOT):
             if not wait_released(p, self.cfg.release_wait_sec):
-                raise StepError("PST_LOCKED", f"Outlook がファイルを解放しません: {p.name}", transient=True)
+                raise locked_error(p, "Outlook がファイルを解放しません")
         (work / SNAPSHOT).unlink(missing_ok=True)
         archive.unlink(missing_ok=True)
 
@@ -910,7 +944,7 @@ class Runner:
 
         # 上の SHA-256 計算（数GBで数分）の間に、ウイルス対策ソフト等が旧PSTを開くことがあるので直前にもう一度待つ
         if not wait_released(old_pst, c.release_wait_sec):
-            raise StepError("PST_LOCKED", f"ファイルが使用中のままです: {old_pst.name}", transient=True)
+            raise locked_error(old_pst, "ファイルが使用中のままです")
         _run_7z(
             [
                 "a",
@@ -996,8 +1030,54 @@ def reset(home: Path, key: str) -> bool:
     e = st.psts.get(key)
     if e is None:
         return False
+    _reset_entry(e)
+    st.save()
+    return True
+
+
+def _reset_entry(e: dict) -> None:
     if e.get("split_mode") == "live":
         _new_live_generation(e)
     e.update(status="PENDING", attempts=0, last_error=None)
-    st.save()
-    return True
+
+
+def purge_orphan_work(work_root: Path, psts: dict) -> None:
+    """完了済み・台帳に無いPSTの作業フォルダーを消す（空き不足の PC で残骸が場所を取らないように。§18.6）。
+
+    FAILED・処理中のものは reset 後の再開に使うので残す。
+    """
+    if not work_root.is_dir():
+        return
+    for d in work_root.iterdir():
+        e = psts.get(d.name)
+        if d.is_dir() and d.name != CONTACTS_DIR and (e is None or e["status"] == "COMPLETED"):
+            log.info("残っていた作業フォルダーを消します: %s", d)
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def apply_resets(psts: dict, path: Path, computer: str) -> list[str]:
+    """管理者が NAS に置いた reset.json に従い、このPCの FAILED を --reset と同じく戻す（設計書 §18）。
+
+    {"before": "2026-11-12T18:00:00+09:00", "targets": ["TYCO054N/8ab754353bb7", ...]}
+    before より前に FAILED になったものだけ戻す。戻した後にまた失敗したものは繰り返し戻さない。
+    """
+    try:
+        req = json.loads(path.read_text(encoding="utf-8-sig"))
+        before = datetime.fromisoformat(req["before"])
+        if before.tzinfo is None:
+            raise ValueError("before にはタイムゾーンが必要です")
+        keys = {k for c, _, k in (t.partition("/") for t in req["targets"]) if c.upper() == computer.upper()}
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as ex:
+        log.warning("reset.json を読めません: %s", ex)
+        return []
+    done = []
+    for key in sorted(keys):
+        e = psts.get(key)
+        at = ((e or {}).get("last_error") or {}).get("at")
+        if e and e["status"] == "FAILED" and at and datetime.fromisoformat(at) < before:
+            _reset_entry(e)
+            done.append(key)
+            log.info("PST %s: reset.json により PENDING に戻しました（%s の FAILED）", key, at)
+    return done

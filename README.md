@@ -402,6 +402,8 @@ Get-ScheduledTask -TaskName PSTMigration                 # タスクがある
 
 ### バージョンアップ
 
+1.2.4（2026-11-12）：**32ビット版 Outlook の PC に対応**（`PSTMigration32.exe` を同梱。`PSTMigration.exe` が Outlook のビット数を見て任せる。従来は 64ビットの EXE から MAPI を使えず、連絡先バックアップ `OUTLOOK_COM` と `LIVE_SPLIT_UNAVAILABLE` になっていた）。NAS の `_admin\reset.json` で FAILED をPCごとに戻せるようにした（[FAILED を再試行させる](#failed-を再試行させる)）。診断の追加：PCの環境（ツール/Outlook のビット数・Office の版・空き容量・作業フォルダー容量・NAS 接続可否・MAPI の失敗理由）を status.json と `_admin\pcs.csv` に、`PST_LOCKED` に掴んでいるプロセス名、転送失敗に段階・転送済みバイト・経過秒、直近20回分の実行ログを NAS の `users\<所有者>\<PC>\logs\` に置く。ライブ分割の転送で、途切れた `.partial` の末尾64MBを書き直してから再開する。転送後の不一致でローカルの束を読み直せないとき（別プロセスが使用中）を `ACCESS_DENIED` ではなく `HASH_MISMATCH`（再試行）にする。計画後に元PSTのフォルダーが見つからないときは `SOURCE_CHANGED_DURING_COPY` にし、同じ階層の同名フォルダーもたどる。`CHUNK_MISMATCH` に指紋のどの項目が違うか（件名は値なし）を出す。完了済み・台帳に無いPSTの作業フォルダーを消す。設計書 §18。
+
 1.2.3（2026-11-04）：障害解析と検証済み成果物からの再開を改善。`UNEXPECTED` は即 `FAILED` にして、例外クラス・内部例外付きスタックトレース・発生工程・発生時バージョンを `last_error` に保存する。`--aggregate` で詳細を `_admin/errors.json` に集約する。`ARCHIVED` の再開時はサイズとSHA-256を確認し、不正な成果物は消さずに停止する。`TRANSFERRED` からの完了登録再開もNASを照合する。ライブ分割は調査前にも最低限の空き容量を確認する。詳細と復旧手順は設計書 §17。
 
 `ledger.csv` の末尾に、世代・出典 `status.json`・同一PC/同一PSTパスの重複候補・再収集要否・例外情報を追加。重複行は履歴か別対象かを判断できないため削除しない。`source_gb` は実サイズ0と未取得（空欄）を区別する。
@@ -434,6 +436,8 @@ Start-Process "\\tsuchiyoshi.private\NETLOGON\PSTMigration\PSTMigration.exe" -Ar
 | `purview_mapping_draft.csv` | Purview インポート用マッピングCSVのたたき台（新メールPST1つにつき1行。ライブ分割は束ごと） |
 | `archive_list.csv` | 旧メール7zの一覧（サイズ・SHA-256。ライブ分割は束ごと） |
 | `recollect_candidates.csv` | 処理後に元PSTへメールが増えた収集単位（移行直前の再回収の候補） |
+| `errors.json` | エラーの詳細（例外・スタックトレース・転送の段階など） |
+| `pcs.csv` | 1行＝1PC（ユーザー）。ツール/Outlook のビット数・空き容量・連絡先バックアップと実行時のエラー（1.2.4以降。各PCのログは `users\<所有者>\<PC>\logs\`） |
 
 `ledger.csv` で見るところ：
 
@@ -499,6 +503,14 @@ Start-Process "$env:LOCALAPPDATA\PSTMigration\bin\PSTMigration.exe" -ArgumentLis
 ```
 
 `pst_key` は ledger.csv の列にある。
+
+多数のPCをまとめて戻すとき（1.2.4以降）：管理者が `\\192.168.8.120\PSTBackup\_admin\reset.json` を置く。各PCは次の実行時に、自分のPC名の行のうち `before` より前に FAILED になったものだけを `--reset` と同じく戻す。戻した後にまた失敗したものは繰り返し戻さない（もう一度戻すなら `before` を新しくして置き直す）。ファイルが無い・壊れているときは何もしない。
+
+```json
+{"before": "2026-11-12T18:00:00+09:00", "targets": ["TYCO054N/8ab754353bb7", "TYCO124N/36668f3d5ade"]}
+```
+
+`targets` は `PC名/pst_key`（ledger.csv の `computer` と `pst_key`）。同じ pst_key が別のPCにあることがあるのでPC名も書く。
 
 - ふつうの方式：途中まで済んでいる段階は保持され、続きから再開する。
 - ライブ分割：最初（調査）から新しいフォルダーに作り直す。前のフォルダーは、新しいフォルダーへの転送が全部済んだ時点で NAS から消す。

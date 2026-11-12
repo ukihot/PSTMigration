@@ -21,6 +21,7 @@ from pstmigration.state import StepError
 log = logging.getLogger(__name__)
 
 CHUNK = 4 * 1024 * 1024
+RESUME_BACKOFF = 64 * 1024 * 1024  # 再開時に捨てる .partial の末尾
 ERROR_SESSION_CREDENTIAL_CONFLICT = 1219
 
 
@@ -92,6 +93,9 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: boo
 
     既存の正式名ファイルは上書きしない。overwrite=True（毎回作り直すバックアップ用）なら置き換える。
     """
+    # 失敗時の診断用（設計書 §18.5）：どの段階で、何バイト目で、何秒後に
+    diag = {"stage": "prepare", "destination": str(dst), "offset": 0, "sent": 0, "size": None}
+    t0 = time.monotonic()
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         part = dst.with_name(dst.name + ".partial")
@@ -103,13 +107,18 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: boo
                 return
             raise StepError("REMOTE_CONFLICT", f"同名で内容の異なるファイルがあります: {dst}", final=True)
 
-        size = src.stat().st_size
+        size = diag["size"] = src.stat().st_size
         offset = part.stat().st_size if part.exists() else 0
         if offset > size:
             part.unlink()
             offset = 0
         if offset:
+            # 前回が通信エラーで途切れていると、末尾は NAS に書けたと報告されただけで中身が欠けていることがある。
+            # 少し戻して書き直す。ponytail: 戻し幅は固定。途中まで壊れていれば照合で全体をやり直す
+            offset = max(0, offset - RESUME_BACKOFF)
+            os.truncate(part, offset)
             log.info("転送再開: %s (%d / %d bytes)", dst.name, offset, size)
+        diag.update(stage="write", offset=offset)
 
         rate = max_mbps * 125_000  # Mbps → bytes/sec
         start, sent = time.monotonic(), 0
@@ -118,19 +127,26 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: boo
             while chunk := fi.read(CHUNK):
                 fo.write(chunk)
                 sent += len(chunk)
+                diag["sent"] = sent
                 if rate > 0:
                     ahead = sent / rate - (time.monotonic() - start)
                     if ahead > 0:
                         time.sleep(ahead)
 
+        diag["stage"] = "verify"
         remote_sha = sha256_file(part)
         if remote_sha != sha256:
-            local_sha = sha256_file(src)
+            remote_size = part.stat().st_size
+            try:
+                local_sha = sha256_file(src)
+            except OSError:  # Windows Search 等が掴んでいる。ローカルの変化は断定せず再試行に回す
+                local_sha = None
             part.unlink()
             raise StepError(
                 "HASH_MISMATCH",
                 f"転送後のSHA-256が一致しません: {dst}",
-                final=local_sha != sha256,
+                final=local_sha is not None and local_sha != sha256,
+                transient=local_sha is None,
                 details={
                     "stage": "transfer_verify",
                     "source": str(src),
@@ -139,16 +155,29 @@ def upload(src: Path, dst: Path, sha256: str, max_mbps: float, *, overwrite: boo
                     "remote_sha256": remote_sha,
                     "local_sha256": local_sha,
                     "local_matches_expected": local_sha == sha256,
+                    "remote_size": remote_size,
+                    "size": size,
+                    "resumed_from": offset,
+                    "elapsed_s": round(time.monotonic() - t0),
                 },
             )
+        diag["stage"] = "rename"
         if overwrite:
             os.replace(part, dst)
         else:
             os.rename(part, dst)  # Windows の rename は既存ファイルを上書きしない
-        log.info("転送完了: %s", dst)
+        secs = time.monotonic() - t0
+        log.info(
+            "転送完了: %s (%d bytes, 再開位置 %d, %.0f 秒, %.1f Mbps)",
+            dst,
+            size,
+            offset,
+            secs,
+            sent * 8 / 1e6 / max(secs, 1e-3),
+        )
     except StepError:
         raise
-    except PermissionError as e:
-        raise StepError("ACCESS_DENIED", str(e), transient=True) from e
     except OSError as e:
-        raise StepError("NETWORK", str(e), transient=True) from e
+        diag.update(elapsed_s=round(time.monotonic() - t0), winerror=getattr(e, "winerror", None), file=e.filename)
+        code = "ACCESS_DENIED" if isinstance(e, PermissionError) else "NETWORK"
+        raise StepError(code, str(e), transient=True, details=diag) from e

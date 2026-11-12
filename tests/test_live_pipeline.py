@@ -224,9 +224,9 @@ def test_reset_of_failed_live_pst_starts_new_generation(env):
     assert e2["stale_remote_dirs"] == ["users\\a@x.jp\\PC1\\big_key1_1"]
 
 
-def test_live_finalization_resumes_without_mapi_and_checks_nas(env, monkeypatch):
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_live_finalization_resumes_without_mapi_and_checks_nas(env, monkeypatch, corrupt):
     r, e, src, tmp = env
-    original = r._finish
 
     def disconnect(*args):
         # 実際の _finish と同様にチェックポイントを先に永続化して失敗する。
@@ -236,12 +236,42 @@ def test_live_finalization_resumes_without_mapi_and_checks_nas(env, monkeypatch)
     monkeypatch.setattr(r, "_finish", disconnect)
     r._process_live(e)
     assert e["checkpoint"] == "TRANSFERRED" and e["status"] == "RETRY_PENDING"
-    assert (r.cfg.work_path / "key1").exists()
-    monkeypatch.setattr(r, "_finish", original)
+    work = r.cfg.work_path / "key1"
+    assert work.exists()
+    remote = r.cfg.server_path / e["remote_dir"]
+    if corrupt:
+        path = remote / e["chunks"][0]["name"]
+        content = bytearray(path.read_bytes())
+        content[-1] ^= 1  # サイズを変えずに壊す。サイズ確認だけでは検知できない。
+        path.write_bytes(content)
+    r.st.save()
     monkeypatch.setattr(mapilive, "logon", lambda *a: pytest.fail("完了登録に MAPI は不要"))
+    monkeypatch.setattr(pipeline.LiveOps, "upload", lambda *a: pytest.fail("完了登録で再転送した"))
     scans = src.scans
-    r._process_live(e)
-    assert e["status"] == "COMPLETED" and src.scans == scans
+    resumed = pipeline.Runner(r.cfg, r.home)
+    e = resumed.st.psts["key1"]
+    resumed._process_live(e)
+    assert src.scans == scans and e["checkpoint"] == "TRANSFERRED"
+    if corrupt:
+        assert e["status"] == "FAILED" and e["last_error"]["code"] == "ARTIFACT_MISMATCH"
+        assert work.exists() and not (remote / "report.json").exists()
+    else:
+        assert e["status"] == "COMPLETED" and e["last_error"] is None
+        assert not work.exists() and read_json(remote / "report.json", {})["errors"] == []
+
+
+@pytest.mark.parametrize("counts", [{"old": -1, "new": 0}, {"old": True, "new": 0}, {"old": 0.0, "new": 0}, [0, 0]])
+def test_live_transferred_rejects_invalid_counts_before_checking_chunks(env, monkeypatch, counts):
+    r, e, src, tmp = env
+    e.update(checkpoint="TRANSFERRED", remote_dir="unit", counts=counts, chunks=[])
+    r.st.save()
+    monkeypatch.setattr(mapilive, "logon", lambda *a: pytest.fail("不正な状態から MAPI を開いた"))
+    resumed = pipeline.Runner(r.cfg, r.home)
+    e = resumed.st.psts["key1"]
+    resumed._process_live(e)
+    assert (e["status"], e["checkpoint"]) == ("FAILED", "TRANSFERRED")
+    assert e["last_error"]["code"] == "ARTIFACT_METADATA" and not e["last_error"]["retryable"]
+    assert not nas_files(tmp)
 
 
 def test_live_transferred_missing_chunk_is_not_completed(env, monkeypatch):

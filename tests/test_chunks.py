@@ -157,6 +157,14 @@ def _copy_case(draw):
     return source, planned[start:end], copied
 
 
+def test_mismatch_names_which_fingerprint_fields_differ_without_subject_value():
+    fp = lambda subj, att: f"{subj}|2020-01-01T00:00:00+00:00|2020-01-01T00:00:00+00:00|IPM.Note|{att}"  # noqa: E731
+    out = chunks.mismatches([row("受信", "X", fp("秘密|件名", "0"))], [row("受信", "X", fp("秘密|件名", "1"))], set())
+    assert out[0] == "差分 受信 key=X: 添付 0→1" and "秘密" not in " ".join(out)
+    out = chunks.mismatches([row("受信", "X", fp("a", "0"))], [row("受信", "X", fp("b", "0"))], set())
+    assert out[0] == "差分 受信 key=X: 件名"
+
+
 def test_missing_required_hash_fails():
     """ハッシュが要る組で、期待側・束側ともハッシュが無い行は一致にしない。"""
     r = {"f": "Inbox", "k": "KEY-001", "p": ("subject", "date")}

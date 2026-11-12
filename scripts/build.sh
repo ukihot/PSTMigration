@@ -33,12 +33,31 @@ uv run pyinstaller --noconfirm --clean --onefile --noconsole \
   --distpath build/dist --workpath build/work --specpath build \
   src/pstmigration/__main__.py
 
+# 32ビット版 Outlook の PC 用（64ビットの EXE からは MAPI を使えない。設計書 §18.6）。
+# PSTMigration.exe が Outlook のビット数を見て、同じフォルダーのこちらに任せる。
+uv python install cpython-3.12-windows-x86-none >/dev/null
+py32="$(uv python find cpython-3.12-windows-x86-none)"
+uv venv -q --allow-existing --python "$py32" build/venv32
+uv export --frozen --no-hashes --no-emit-project > build/requirements32.txt
+VIRTUAL_ENV=build/venv32 uv pip install -q -r build/requirements32.txt
+build/venv32/Scripts/python.exe -c "import struct; assert struct.calcsize('P') == 4"
+build/venv32/Scripts/pyinstaller --noconfirm --clean --onefile --noconsole \
+  --name PSTMigration32 \
+  --paths src \
+  --hidden-import win32timezone \
+  --hidden-import win32comext.mapi.mapi \
+  --add-binary "$sz\\7z.exe;." \
+  --add-binary "$sz\\7z.dll;." \
+  --distpath build/dist --workpath build/work32 --specpath build \
+  src/pstmigration/__main__.py
+
 out=dist/PSTMigration
 rm -rf "$out"
 mkdir -p "$out"
-cp build/dist/PSTMigration.exe config.json scripts/PSTMigration-manual.cmd scripts/PSTMigration-manual.ps1 "$out/"
+cp build/dist/PSTMigration.exe build/dist/PSTMigration32.exe config.json \
+  scripts/PSTMigration-manual.cmd scripts/PSTMigration-manual.ps1 "$out/"
 [[ -f "$SEVENZIP_DIR/License.txt" ]] && cp "$SEVENZIP_DIR/License.txt" "$out/7-Zip-License.txt"
-(cd "$out" && sha256sum PSTMigration.exe config.json > SHA256SUMS.txt)
+(cd "$out" && sha256sum PSTMigration.exe PSTMigration32.exe config.json > SHA256SUMS.txt)
 
 echo "OK: $out"
 cat "$out/SHA256SUMS.txt"

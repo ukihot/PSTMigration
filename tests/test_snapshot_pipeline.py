@@ -1,6 +1,7 @@
 """ARCHIVED / TRANSFERRED で中断したスナップショットの復旧。NAS は一時フォルダーを使う。"""
 
 import csv
+import json
 
 import pytest
 
@@ -103,6 +104,47 @@ def test_archived_missing_local_copy_can_use_verified_nas_copy(archived):
     assert e["status"] == "COMPLETED" and remote.read_bytes() == b"new mail"
 
 
+@pytest.mark.parametrize("checkpoint", ["ARCHIVED", "TRANSFERRED"])
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"old": -1, "new": 2},
+        {"old": 1, "new": -1},
+        {"old": True, "new": 2},
+        {"old": 1.0, "new": 2},
+        {"old": "1", "new": 2},
+        {"old": None, "new": 2},
+        {"old": 1, "new": 2, "unmigrated": -1},
+        {"old": 1},
+        [1, 2],
+        None,
+    ],
+)
+def test_resume_rejects_invalid_counts_without_removing_artifacts(archived, checkpoint, counts):
+    r, e, work = archived
+    if checkpoint == "TRANSFERRED":
+        r._transfer(e, work)
+    e["counts"] = counts
+    r.st.save()
+    resumed, e = reload_runner(r)
+    resumed._process(e)
+    assert (e["status"], e["checkpoint"]) == ("FAILED", checkpoint)
+    assert e["last_error"]["code"] == "ARTIFACT_METADATA" and not e["last_error"]["retryable"]
+    assert work.exists() and (work / r.names.old_7z).read_bytes() == b"old mail"
+    assert not list(r.cfg.server_path.rglob("report.json"))
+
+
+@pytest.mark.parametrize("old,new", [(0, 2), (1, 0), (0, 0)])
+def test_resume_accepts_zero_counts_without_an_output_for_that_side(archived, old, new):
+    r, e, work = archived
+    e["counts"].update(old=old, new=new)
+    for kind, count in (("old_7z", old), ("new_pst", new)):
+        if not count:
+            del e["outputs"][kind]
+    r._process(e)
+    assert e["status"] == "COMPLETED" and not work.exists()
+
+
 def test_failed_report_write_resumes_without_outlook_or_retransfer(archived, monkeypatch):
     r, e, work = archived
     write = pipeline.write_json
@@ -117,20 +159,38 @@ def test_failed_report_write_resumes_without_outlook_or_retransfer(archived, mon
     assert (e["status"], e["checkpoint"]) == ("RETRY_PENDING", "TRANSFERRED")
     assert e["last_error"]["phase"] == "FINALIZING"
     r.st.save()
+    report.publish_status(r.cfg.server_path, r.st.data, "a", "PC1")
+    out = report.aggregate(r.cfg.server_path)
+    assert read_json(out / "errors.json", [])[0]["error"]["code"] == "NETWORK"
     monkeypatch.setattr(pipeline, "write_json", write)
     monkeypatch.setattr(transfer, "upload", lambda *a: pytest.fail("完了登録の再開で再転送した"))
     resumed, e = reload_runner(r)
     resumed._process(e)
     assert e["status"] == "COMPLETED" and not work.exists()
     assert read_json(r.cfg.server_path / e["remote_dir"] / "report.json", {})["errors"] == []
+    resumed.st.save()
+    persisted = read_json(resumed.st.path, {})["psts"][e["key"]]
+    assert persisted["status"] == "COMPLETED" and persisted["last_error"] is None
+    report.publish_status(resumed.cfg.server_path, resumed.st.data, "a", "PC1")
+    status = read_json(resumed.cfg.server_path / "users" / "a@x.jp" / "PC1" / "status.json", {})
+    assert status["psts"][0]["status"] == "COMPLETED" and status["psts"][0]["last_error"] is None
+    assert read_json(report.aggregate(resumed.cfg.server_path) / "errors.json", None) == []
 
 
-def test_transferred_remote_corruption_is_not_completed(archived):
+@pytest.mark.parametrize("damage", ["same_size", "different_size", "missing"])
+def test_transferred_remote_corruption_is_not_completed(archived, monkeypatch, damage):
     r, e, work = archived
     r._transfer(e, work)
     o = e["outputs"]["new_pst"]
-    (r.cfg.server_path / e["remote_dir"] / o["name"]).write_bytes(b"bad mail")
-    r._process(e)
+    remote = r.cfg.server_path / e["remote_dir"] / o["name"]
+    if damage == "missing":
+        remote.unlink()
+    else:
+        remote.write_bytes(b"bad mail" if damage == "same_size" else b"bad")
+    r.st.save()
+    monkeypatch.setattr(transfer, "upload", lambda *a: pytest.fail("不一致を再転送で隠した"))
+    resumed, e = reload_runner(r)
+    resumed._process(e)
     assert e["status"] == "FAILED" and e["last_error"]["code"] == "ARTIFACT_MISMATCH"
     assert work.exists() and not list(r.cfg.server_path.rglob("report.json"))
 
@@ -157,6 +217,28 @@ def test_unknown_exception_is_terminal_and_published_with_cause(archived, monkey
         row = next(csv.DictReader(f))
     assert row["last_error_message"] == "RuntimeError('outer failure')"
     assert row["last_error_exception_type"] == "builtins.RuntimeError"
+
+
+def test_reset_json_on_nas_resets_only_this_pcs_old_failures_once(archived, tmp_path):
+    r, e, work = archived
+    e.update(status="FAILED", last_error={"code": "UNEXPECTED", "at": "2026-10-28T08:50:29+09:00"})
+    other = {"status": "FAILED", "last_error": {"at": "2026-10-28T00:00:00+09:00"}}
+    later = {"status": "FAILED", "last_error": {"at": "2026-11-13T00:00:00+09:00"}}  # 一覧を書いた後の失敗
+    psts = {"key1": e, "key2": other, "key3": later}
+    req = tmp_path / "reset.json"
+    req.write_text(
+        json.dumps({"before": "2026-11-12T18:00:00+09:00", "targets": ["pc1/key1", "PC2/key2", "PC1/key3"]}),
+        encoding="utf-8",
+    )
+    assert pipeline.apply_resets(psts, req, "PC1") == ["key1"]
+    assert (e["status"], e["last_error"], other["status"], later["status"]) == ("PENDING", None, "FAILED", "FAILED")
+    r._process(e)  # ARCHIVED から転送だけやり直す
+    assert e["status"] == "COMPLETED" and e["generation"] == 1
+    e.update(status="FAILED", last_error={"at": "2026-11-13T09:00:00+09:00"})  # 戻した後の再失敗は戻さない
+    assert pipeline.apply_resets(psts, req, "PC1") == []
+    assert pipeline.apply_resets(psts, tmp_path / "none.json", "PC1") == []
+    req.write_text("{broken", encoding="utf-8")
+    assert pipeline.apply_resets(psts, req, "PC1") == []
 
 
 def test_snapshot_reset_keeps_checkpoint_and_artifacts(archived):

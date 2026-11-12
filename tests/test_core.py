@@ -211,7 +211,35 @@ def test_upload_hash_mismatch_discards_partial(tmp_path):
     assert not dst.exists() and not (tmp_path / "r" / "a.pst.partial").exists()
 
 
-def test_upload_corrupt_partial_distinguishes_transport_from_local_change(tmp_path):
+def test_upload_resume_rewrites_the_tail_of_an_interrupted_partial(tmp_path, monkeypatch):
+    # 前回の転送が途切れ、末尾だけ壊れた .partial。戻し幅の分を書き直せば照合に通る
+    monkeypatch.setattr(transfer, "RESUME_BACKOFF", 100)
+    src, dst = tmp_path / "a.pst", tmp_path / "nas" / "a.pst"
+    src.write_bytes(bytes(range(256)) * 10)
+    dst.parent.mkdir()
+    dst.with_name("a.pst.partial").write_bytes(src.read_bytes()[:1000] + b"X" * 50)
+    transfer.upload(src, dst, transfer.sha256_file(src), 0)
+    assert dst.read_bytes() == src.read_bytes()
+
+
+def test_upload_mismatch_with_locked_source_is_retried_not_access_denied(tmp_path, monkeypatch):
+    src, dst = tmp_path / "a.pst", tmp_path / "nas" / "a.pst"
+    src.write_bytes(b"abc")
+    real = transfer.sha256_file
+
+    def sha(p):
+        if p == src:  # 照合後にローカルを読み直すと、別プロセスが掴んでいる
+            raise PermissionError(13, "Permission denied")
+        return real(p)
+
+    monkeypatch.setattr(transfer, "sha256_file", sha)
+    with pytest.raises(StepError) as ex:
+        transfer.upload(src, dst, "0" * 64, 0)
+    assert ex.value.code == "HASH_MISMATCH" and ex.value.transient and not ex.value.final
+
+
+def test_upload_corrupt_partial_distinguishes_transport_from_local_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(transfer, "RESUME_BACKOFF", 0)  # 壊れた .partial をそのまま続きに使わせる
     src, dst = tmp_path / "source.pst", tmp_path / "nas" / "out.pst"
     src.write_bytes(b"abcdefgh")
     dst.parent.mkdir()

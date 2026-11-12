@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import ntpath
+import shutil
 from collections import Counter
 from pathlib import Path, PureWindowsPath
 
@@ -74,8 +75,14 @@ def build(entry: dict, status: str, data: dict, user: str, computer: str, folder
     }
 
 
-def publish_status(server_root: Path, data: dict, user: str, computer: str) -> None:
-    """このPC・ユーザーの状態をサーバへ（失敗しても処理は続ける）。"""
+LOGS_TO_PUBLISH = 20  # 直近の実行ログ（JSONL）をこの数だけ NAS に置く
+
+
+def publish_status(server_root: Path, data: dict, user: str, computer: str, log_dir: Path | None = None) -> None:
+    """このPC・ユーザーの状態と直近の実行ログをサーバへ（失敗しても処理は続ける）。
+
+    ログは PC に行かずに原因を調べるため（設計書 §18.5）。件名は log_subject=false なら含まれない。
+    """
     owner = data.get("mailbox") or user
     status = {
         "mailbox": data.get("mailbox"),
@@ -86,12 +93,25 @@ def publish_status(server_root: Path, data: dict, user: str, computer: str) -> N
         "updated_at": now_iso(),
         "last_run_error": data.get("last_run_error"),
         "contacts": data.get("contacts"),
+        "env": data.get("env"),
         "psts": [{k: e.get(k) for k in STATUS_KEYS} for e in data["psts"].values()],
     }
+    dest = server_root / "users" / owner / computer
     try:
-        write_json(server_root / "users" / owner / computer / "status.json", status)
+        write_json(dest / "status.json", status)
     except OSError as e:
         log.warning("status.json をサーバへ出力できません: %s", e)
+        return
+    if log_dir is None:
+        return
+    try:
+        (dest / "logs").mkdir(exist_ok=True)
+        for f in sorted(log_dir.glob("run-*.jsonl"))[-LOGS_TO_PUBLISH:]:
+            remote = dest / "logs" / f.name
+            if not remote.exists() or remote.stat().st_size != f.stat().st_size:
+                shutil.copyfile(f, remote)
+    except OSError as e:
+        log.warning("ログをサーバへ出力できません: %s", e)
 
 
 def _files(p: dict) -> list[tuple[str, dict, int | None]]:
@@ -272,6 +292,28 @@ def aggregate(root: Path) -> Path:
         ledger,
     )
     write_json(out / "errors.json", errors)
+    pcs = []
+    for _, s in statuses:  # PCごとの環境・連絡先・実行時エラー（設計書 §18.5）
+        env, ct, run = s.get("env") or {}, s.get("contacts") or {}, s.get("last_run_error") or {}
+        ct_err, st = ct.get("last_error") or {}, Counter(p["status"] for p in s["psts"])
+        pcs.append(
+            [s["computer"], s["user"], s.get("mailbox"), s["tool_version"], s["updated_at"]]
+            + [env.get(k) for k in ("tool_bits", "outlook_bitness", "office_version", "windows")]
+            + [env.get(k) for k in ("free_gb", "work_gb", "nas_connected", "mapi_error")]
+            + [ct.get("backup_at"), ct.get("count"), ct_err.get("code"), ct_err.get("message")]
+            + [run.get("code"), run.get("message")]
+            + [len(s["psts"]), st["COMPLETED"], st["FAILED"], st["RETRY_PENDING"]]
+        )
+    _write_csv(
+        out / "pcs.csv",
+        ["computer", "user", "mailbox", "tool_version", "updated_at"]
+        + ["tool_bits", "outlook_bitness", "office_version", "windows"]
+        + ["free_gb", "work_gb", "nas_connected", "mapi_error"]
+        + ["contacts_backup_at", "contacts_count", "contacts_error_code", "contacts_error_message"]
+        + ["run_error_code", "run_error_message"]
+        + ["psts", "completed", "failed", "retry_pending"],
+        pcs,
+    )
     _write_csv(
         out / "recollect_candidates.csv",  # 調査後に増えたメールがある収集単位（移行直前の再回収の候補。§16.7）
         ["mailbox", "computer", "pst_key", "source_path", "status", "source_added", "warnings"],

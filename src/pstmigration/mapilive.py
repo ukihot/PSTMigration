@@ -336,14 +336,20 @@ class MapiStore:
     def folder(self, path: str):
         f = self._folders.get(path)
         if f is None:
-            f = self.open(self._root_eid)
-            for name in path.strip("\\").split("\\"):
-                eid = next((e for e, n, _, _ in self._children(f) if n == name), None)
-                if eid is None:
-                    raise KeyError(path)
-                f = self.open(eid)
+            f = self._find(self.open(self._root_eid), path.strip("\\").split("\\"))
+            if f is None:  # 計画後にフォルダーが名前変更・移動・削除された
+                raise StepError("SOURCE_CHANGED_DURING_COPY", f"フォルダーが見つからない {path}", final=True)
             self._folders[path] = f
         return f
+
+    def _find(self, folder, names: list[str]):
+        """同じ階層に同名フォルダーが複数あっても、パスが続く方を探す（walk は全部をたどるため）。"""
+        if not names:
+            return folder
+        for eid, n, _, _ in self._children(folder):
+            if n == names[0] and (hit := self._find(self.open(eid), names[1:])) is not None:
+                return hit
+        return None
 
     def ensure_folder(self, path: str, container_class: str | None):
         """書き込み用：無ければ作る（親も）。"""

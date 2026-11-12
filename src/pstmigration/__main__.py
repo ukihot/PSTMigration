@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -27,7 +28,7 @@ import win32api
 import win32event
 import win32process
 
-from pstmigration import __version__, config, pipeline, report
+from pstmigration import __version__, config, pipeline, report, winenv
 
 log = logging.getLogger("pstmigration")
 
@@ -99,6 +100,21 @@ def default_config_path() -> Path:
     return Path(__file__).resolve().parents[2] / "config.json"
 
 
+def delegate_to_32bit(argv: list[str]) -> int | None:
+    """32ビット版 Outlook の PC では、64ビットの EXE から MAPI を使えない（連絡先・ライブ分割が失敗する）。
+
+    同じフォルダーの PSTMigration32.exe に同じ引数で任せ、その終了コードを返す。任せないときは None。
+    """
+    if winenv.TOOL_BITS != 64 or winenv.outlook()["bitness"] != "x86":
+        return None
+    exe32 = Path(sys.executable).with_name("PSTMigration32.exe")
+    if not getattr(sys, "frozen", False) or not exe32.exists():
+        log.warning("32ビット版 Outlook ですが PSTMigration32.exe がありません。64ビット版のまま続けます")
+        return None
+    log.info("32ビット版 Outlook のため %s に任せます", exe32)
+    return subprocess.run([str(exe32), *argv], check=False, creationflags=subprocess.CREATE_NO_WINDOW).returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="PSTMigration")
     mode = p.add_mutually_exclusive_group()
@@ -119,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("PSTMigration %s 開始 args=%s", __version__, argv if argv is not None else sys.argv[1:])
 
     try:
+        if not (args.aggregate or args.version or args.snapshot or args.reset):
+            code = delegate_to_32bit(sys.argv[1:] if argv is None else argv)
+            if code is not None:
+                return code
         if args.aggregate:
             if not Path(args.aggregate).is_dir():
                 log.error("集計対象フォルダーがありません: %s", args.aggregate)

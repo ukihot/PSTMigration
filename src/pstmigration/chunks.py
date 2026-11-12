@@ -105,6 +105,34 @@ def size_deltas(expected: list[dict], actual: list[dict], need: set[tuple]) -> d
     return dict(c)
 
 
+_FP_FIELDS = ("件名", "配信日時", "送信日時", "クラス", "添付")
+
+
+def _fingerprint_diffs(missing: Counter, extra: Counter) -> list[str]:
+    """欠落と余計に同じフォルダー＋SearchKey があれば、指紋のどの項目が違うかを示す（診断用）。
+
+    件名は値を出さない（log_subject と同じ扱い）。日時・クラス・添付有無は値を出す。
+    """
+    out = []
+    for f, k, p, h in missing:
+        q = next((x for x in extra if x[:2] == (f, k)), None)
+        if q is None:
+            continue
+        a, b = p.rsplit("|", 4), q[2].rsplit("|", 4)
+        if len(a) != len(b) or len(a) != len(_FP_FIELDS):
+            what = ["指紋"] if p != q[2] else []
+        else:
+            what = [
+                n if n == "件名" else f"{n} {x or '-'}→{y or '-'}"
+                for n, x, y in zip(_FP_FIELDS, a, b, strict=True)
+                if x != y
+            ]
+        if h != q[3]:
+            what.append("本文・添付")
+        out.append(f"差分 {f} key={k}: {', '.join(what) or '不明'}")
+    return out
+
+
 def mismatches(expected: list[dict], actual: list[dict], need: set[tuple]) -> list[str]:
     """期待した行と束の中の行の「フォルダー＋SearchKey＋指紋（＋必要ならハッシュ）」の多重集合の差。空なら一致。
 
@@ -123,6 +151,7 @@ def mismatches(expected: list[dict], actual: list[dict], need: set[tuple]) -> li
     want, got = Counter(map(key, expected)), Counter(map(key, actual))
     return (
         no_hash
+        + _fingerprint_diffs(want - got, got - want)
         + [f"欠落 {k[0]} key={k[1]} ×{n}" for k, n in (want - got).items()]
         + [f"余計 {k[0]} key={k[1]} ×{n}" for k, n in (got - want).items()]
     )

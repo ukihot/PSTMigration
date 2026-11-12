@@ -120,6 +120,20 @@ def test_create_folder_uses_unicode_without_ansi_conversion(name):
     assert calls == [name]
 
 
+def test_folder_lookup_follows_same_named_siblings_and_reports_missing_as_source_change():
+    # ルートに「受信トレイ」が2つ。探すフォルダーは2つ目の配下にだけある
+    tree = {b"root": [b"in1", b"in2"], b"in1": [], b"in2": [b"t"], b"t": []}
+    names = {b"in1": "受信トレイ", b"in2": "受信トレイ", b"t": "【　取引先　】"}
+    store = object.__new__(mapilive.MapiStore)
+    store._folders, store._root_eid = {}, b"root"
+    store.open = lambda eid: eid
+    store._children = lambda f: [(c, names[c], None, 1) for c in tree[f]]
+    assert store.folder("\\受信トレイ\\【　取引先　】") == b"t"
+    with pytest.raises(mapilive.StepError) as ei:
+        store.folder("\\受信トレイ\\改名済み")
+    assert ei.value.code == "SOURCE_CHANGED_DURING_COPY" and ei.value.final
+
+
 # ---- 連絡先バックアップのコピー計画（どのフォルダーを、どこへ） --------------------------------
 
 
